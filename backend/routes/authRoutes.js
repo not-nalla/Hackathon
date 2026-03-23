@@ -21,7 +21,7 @@ configureGoogleAuth({
 });
 
 const generateToken = (userId) => {
-  const jwtSecret = process.env.JWT_SECRET;
+  const jwtSecret = process.env.JWT_SECRET || process.env.SESSION_SECRET;
   if (!jwtSecret) throw new Error('JWT_SECRET is not configured');
   return jwt.sign({ userId }, jwtSecret, { expiresIn: '7d' });
 };

@@ -6,7 +6,7 @@ const authMiddleware = (req, res, next) => {
     return res.status(401).json({ error: 'No token provided' });
   }
 
-  const jwtSecret = process.env.JWT_SECRET;
+  const jwtSecret = process.env.JWT_SECRET || process.env.SESSION_SECRET;
   if (!jwtSecret) {
     return res.status(500).json({ error: 'JWT auth is not configured' });
   }
