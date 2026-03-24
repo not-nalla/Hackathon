@@ -11,6 +11,7 @@ const userSchema = new mongoose.Schema({
   phone: { type: String },
   timezone: { type: String, default: 'UTC' },
   avatarInitials: { type: String },
+  avatarUrl: { type: String },
   preferences: {
     autoRecord: { type: Boolean, default: false },
     sendSummaries: { type: Boolean, default: true },

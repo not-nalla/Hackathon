@@ -14,6 +14,11 @@ const meetingSchema = new mongoose.Schema({
   status: { type: String, enum: ['Scheduled', 'Completed', 'Cancelled', 'InProgress'], default: 'Scheduled' },
   recordingUrl: { type: String },
   summary: { type: String },
+  transcript: [{
+    speaker: { type: String },
+    text: { type: String },
+    timestamp: { type: Date, default: Date.now }
+  }],
   // LiveKit room identifier — stable, unique per meeting
   roomId: { type: String, default: () => uuidv4(), unique: true, sparse: true },
   joinUrl: { type: String },

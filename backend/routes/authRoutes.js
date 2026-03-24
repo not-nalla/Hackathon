@@ -12,6 +12,22 @@ const backendBase = (process.env.BACKEND_URL || process.env.BASE_URL || 'http://
 const apiBaseUrl = backendBase.endsWith('/api') ? backendBase : `${backendBase}/api`;
 const googleEnabled = Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 
+const serializeUser = (userDoc) => ({
+  id: userDoc._id,
+  _id: userDoc._id,
+  fullName: userDoc.fullName,
+  email: userDoc.email,
+  initials: userDoc.avatarInitials,
+  avatarInitials: userDoc.avatarInitials,
+  avatarUrl: userDoc.avatarUrl,
+  jobTitle: userDoc.jobTitle,
+  department: userDoc.department,
+  company: userDoc.company,
+  phone: userDoc.phone,
+  timezone: userDoc.timezone,
+  preferences: userDoc.preferences,
+});
+
 configureGoogleAuth({
   passport,
   User,
@@ -67,8 +83,7 @@ router.post('/register', async (req, res) => {
     await newUser.save();
 
     const token = generateToken(newUser._id);
-    const user = { id: newUser._id, fullName: newUser.fullName, email: newUser.email, initials: newUser.avatarInitials };
-    res.json({ token, user });
+    res.json({ token, user: serializeUser(newUser) });
   } catch(err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -84,8 +99,7 @@ router.post('/login', async (req, res) => {
     if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
 
     const token = generateToken(user._id);
-    const safeUser = { id: user._id, fullName: user.fullName, email: user.email, initials: user.avatarInitials };
-    res.json({ token, user: safeUser });
+    res.json({ token, user: serializeUser(user) });
   } catch(err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -96,16 +110,7 @@ router.get('/me', authMiddleware, async (req, res) => {
     const user = await User.findById(req.userId).select('-hashedPassword');
     if (!user) return res.status(404).json({ error: 'User not found' });
     
-    res.json({
-      user: {
-        id: user._id,
-        fullName: user.fullName,
-        email: user.email,
-        initials: user.avatarInitials,
-        jobTitle: user.jobTitle,
-        department: user.department
-      }
-    });
+    res.json({ user: serializeUser(user) });
   } catch(err) {
     res.status(500).json({ error: 'Server error' });
   }

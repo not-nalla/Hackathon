@@ -12,10 +12,21 @@ export const useAuth = () => {
 };
 
 export const AuthProvider = ({ children }) => {
+  const normalizeUser = (rawUser) => {
+    if (!rawUser) return null;
+    return {
+      ...rawUser,
+      id: rawUser.id || rawUser._id,
+      _id: rawUser._id || rawUser.id,
+      initials: rawUser.initials || rawUser.avatarInitials,
+      avatarInitials: rawUser.avatarInitials || rawUser.initials,
+    };
+  };
+
   const [user, setUser] = useState(() => {
     try {
       const stored = localStorage.getItem('smis_user');
-      return stored ? JSON.parse(stored) : null;
+      return stored ? normalizeUser(JSON.parse(stored)) : null;
     } catch(err) { return null; }
   });
   const [loading, setLoading] = useState(true);
@@ -33,8 +44,9 @@ export const AuthProvider = ({ children }) => {
     }
     try {
       const response = await api.get('/api/auth/me');
-      setUser(response.data.user);
-      localStorage.setItem('smis_user', JSON.stringify(response.data.user));
+      const nextUser = normalizeUser(response.data.user);
+      setUser(nextUser);
+      localStorage.setItem('smis_user', JSON.stringify(nextUser));
     } catch (err) {
       setUser(null);
       localStorage.removeItem('smis_token');
@@ -51,8 +63,9 @@ export const AuthProvider = ({ children }) => {
       const response = await api.post('/api/auth/login', { email, password });
       
       localStorage.setItem('smis_token', response.data.token);
-      localStorage.setItem('smis_user', JSON.stringify(response.data.user));
-      setUser(response.data.user);
+      const nextUser = normalizeUser(response.data.user);
+      localStorage.setItem('smis_user', JSON.stringify(nextUser));
+      setUser(nextUser);
       
       return { success: true };
     } catch (err) {
@@ -80,8 +93,9 @@ export const AuthProvider = ({ children }) => {
       });
 
       localStorage.setItem('smis_token', response.data.token);
-      localStorage.setItem('smis_user', JSON.stringify(response.data.user));
-      setUser(response.data.user);
+      const nextUser = normalizeUser(response.data.user);
+      localStorage.setItem('smis_user', JSON.stringify(nextUser));
+      setUser(nextUser);
       
       return { success: true };
     } catch (err) {
@@ -102,22 +116,18 @@ export const AuthProvider = ({ children }) => {
 
   const updateProfile = async (updates) => {
     try {
-      setLoading(true);
       setError(null);
       const response = await api.patch('/api/user/profile', updates);
       
-      // Update local storage object
-      const updatedUser = { ...user, ...response.data };
+      const updatedUser = normalizeUser(response.data);
       localStorage.setItem('smis_user', JSON.stringify(updatedUser));
       setUser(updatedUser);
       
-      return { success: true };
+      return { success: true, user: updatedUser };
     } catch (err) {
       const errorMessage = err.response?.data?.error || 'Failed to update profile.';
       setError(errorMessage);
       return { success: false, error: errorMessage };
-    } finally {
-      setLoading(false);
     }
   };
 

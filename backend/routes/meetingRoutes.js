@@ -3,11 +3,41 @@ const router = express.Router();
 const Meeting = require('../models/Meeting');
 const authMiddleware = require('../middleware/authMiddleware');
 const { AccessToken } = require('livekit-server-sdk');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
 const { randomUUID } = require('crypto');
 
 const getFrontendBaseUrl = () => (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
 const buildJoinUrl = (roomId) => `${getFrontendBaseUrl()}/join/${roomId}`;
 const buildRoomUrl = (roomId) => `${getFrontendBaseUrl()}/room/${roomId}`;
+
+const activeTranscriptionJobs = new Map();
+
+const appendTranscriptEntry = async (roomId, entry) => {
+  const meeting = await Meeting.findOne({ roomId });
+  if (!meeting) return { ok: false, error: 'Meeting not found' };
+
+  const payload = {
+    speaker: entry.speaker || 'Unknown',
+    text: entry.text || '',
+    timestamp: entry.timestamp || new Date(),
+  };
+
+  meeting.transcript.push(payload);
+  await meeting.save();
+
+  try {
+    const dir = path.join(__dirname, '..', 'transcripts');
+    await fsp.mkdir(dir, { recursive: true });
+    const line = `[${new Date(payload.timestamp).toISOString()}] ${payload.speaker}: ${payload.text}\n`;
+    await fsp.appendFile(path.join(dir, `${roomId}.txt`), line, 'utf8');
+  } catch (err) {
+    console.error('Transcript file write failed:', err);
+  }
+
+  return { ok: true };
+};
 
 const toClientMeeting = (meetingDoc) => {
   const meeting = meetingDoc.toObject ? meetingDoc.toObject() : meetingDoc;
@@ -161,6 +191,74 @@ router.get('/room/:roomId', async (req, res) => {
     res.json({ meeting: toClientMeeting(meeting), isHost });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch meeting' });
+  }
+});
+
+// Add transcript entry from LiveKit Web Speech STT
+router.post('/room/:roomId/transcript', async (req, res) => {
+  try {
+    const { speaker, text, timestamp } = req.body;
+    const result = await appendTranscriptEntry(req.params.roomId, { speaker, text, timestamp });
+    if (!result.ok) return res.status(404).json({ error: result.error });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Transcript save error:', err);
+    res.status(500).json({ error: 'Failed to save transcript' });
+  }
+});
+
+// LiveKit transcription callback (use this for LiveKit webhook/agent output)
+router.post('/room/:roomId/transcription/callback', async (req, res) => {
+  try {
+    const { speaker, text, timestamp } = req.body;
+    const result = await appendTranscriptEntry(req.params.roomId, { speaker, text, timestamp });
+    if (!result.ok) return res.status(404).json({ error: result.error });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Transcription callback error:', err);
+    res.status(500).json({ error: 'Failed to process transcription callback' });
+  }
+});
+
+// Start LiveKit transcription (mocked/hardcoded stream for now)
+router.post('/room/:roomId/transcription/start', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (activeTranscriptionJobs.has(roomId)) {
+      return res.json({ success: true, started: false, message: 'Transcription already running' });
+    }
+
+    const speakers = ['LiveKit Screen', 'LiveKit Audio'];
+    let counter = 1;
+    const intervalId = setInterval(async () => {
+      const speaker = speakers[counter % speakers.length];
+      const text = `${speaker} transcript sample ${counter} at ${new Date().toLocaleTimeString()}`;
+      const result = await appendTranscriptEntry(roomId, { speaker, text, timestamp: new Date() });
+      if (!result.ok) {
+        console.error('Transcription append failed:', result.error);
+      }
+      counter += 1;
+    }, 3500);
+
+    activeTranscriptionJobs.set(roomId, intervalId);
+    res.json({ success: true, started: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to start transcription' });
+  }
+});
+
+// Stop LiveKit transcription mock
+router.post('/room/:roomId/transcription/stop', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const intervalId = activeTranscriptionJobs.get(roomId);
+    if (intervalId) {
+      clearInterval(intervalId);
+      activeTranscriptionJobs.delete(roomId);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to stop transcription' });
   }
 });
 

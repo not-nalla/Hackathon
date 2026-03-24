@@ -17,8 +17,8 @@ export const signupSchema = z.object({
     .string()
     .min(2, 'Full name must be at least 2 characters')
     .max(50, 'Full name must be less than 50 characters'),
-  jobTitle: z.string().min(2, 'Job title is required'),
-  department: z.string().min(2, 'Department is required'),
+  jobTitle: z.string().optional().or(z.literal('')),
+  department: z.string().optional().or(z.literal('')),
   email: z
     .string()
     .min(1, 'Email is required')
@@ -30,10 +30,7 @@ export const signupSchema = z.object({
     .regex(/[a-z]/, 'Password must contain at least one lowercase letter')
     .regex(/[0-9]/, 'Password must contain at least one number')
     .regex(/[^A-Za-z0-9]/, 'Password must contain at least one special character'),
-  confirm: z.string().min(1, 'Please confirm your password'),
-  terms: z.boolean().refine(val => val === true, {
-    message: 'You must accept the terms and conditions'
-  })
+  confirm: z.string().min(1, 'Please confirm your password')
 }).refine((data) => data.password === data.confirm, {
   message: "Passwords don't match",
   path: ["confirm"],

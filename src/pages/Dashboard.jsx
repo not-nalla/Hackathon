@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from "react";
-import axios from "axios";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useAuth } from '../contexts/AuthContext';
+import { useAppData } from '../contexts/AppDataContext';
 import { motion, AnimatePresence } from "framer-motion";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Bell, Moon, Search, Sun } from "lucide-react";
+import SmartCopilotPanel from "../components/Copilot/SmartCopilotPanel";
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -13,32 +15,11 @@ import {
   Legend,
 } from "chart.js";
 import { Bar, Doughnut } from "react-chartjs-2";
+import api from '../api/axios';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, ArcElement, Tooltip, Legend);
 
-// ─── Google Sans Font Injection (done in index.html ideally, but keeping here as requested) ───
-if (typeof document !== 'undefined') {
-  if (!document.getElementById('google-sans')) {
-    const fontLink = document.createElement("link");
-    fontLink.id = "google-sans";
-    fontLink.href = "https://fonts.googleapis.com/css2?family=Google+Sans:wght@300;400;500;600;700&family=Google+Sans+Display:wght@400;500;700&display=swap";
-    fontLink.rel = "stylesheet";
-    document.head.appendChild(fontLink);
-    
-    const styleTag = document.createElement("style");
-    styleTag.innerHTML = `
-      *, *::before, *::after { font-family: 'Google Sans', sans-serif !important; box-sizing: border-box; }
-      ::-webkit-scrollbar { width: 4px; }
-      ::-webkit-scrollbar-track { background: #f8fafc; }
-      ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
-      ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-      .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-    `;
-    document.head.appendChild(styleTag);
-  }
-}
-
-// ─── Data ──────────────────────────────────────────────────────────────────────
+// Data ──────────────────────────────────────────────────────────────────────
 const INIT_STATS = [
   { label: "Total Meetings",   value: 128,   delta: "+12 this month",      icon: "📅", grad: "from-blue-500 to-indigo-600",    light: "bg-blue-50",   txt: "text-blue-600"   },
   { label: "Pending Tasks",    value: 14,    delta: "3 overdue",           icon: "⏳", grad: "from-amber-400 to-orange-500",   light: "bg-amber-50",  txt: "text-amber-600"  },
@@ -59,14 +40,6 @@ const INIT_TASKS = [
   { id: 3, name: "Update API documentation",           assignee: "Priya R.", deadline: "Mar 25", done: false },
   { id: 4, name: "Send meeting summaries to stakeholders", assignee: "Aryan K.", deadline: "Mar 21", done: true  },
   { id: 5, name: "Audit task automation workflow",     assignee: "Leo N.",   deadline: "Mar 28", done: false },
-];
-
-const NOTIFICATIONS = [
-  { id: 1, icon: "📅", bg: "bg-blue-50",    msg: "Q3 Roadmap meeting starts in 30 minutes",    time: "Just now",    unread: true  },
-  { id: 2, icon: "⏰", bg: "bg-amber-50",   msg: "Task 'Prepare Q3 brief' is due tomorrow",    time: "2 hours ago", unread: true  },
-  { id: 3, icon: "✅", bg: "bg-emerald-50", msg: "Sara M. completed 'Review onboarding deck'", time: "4 hours ago", unread: true  },
-  { id: 4, icon: "📝", bg: "bg-violet-50",  msg: "Design System Sync summary is ready",        time: "Yesterday",   unread: false },
-  { id: 5, icon: "🔴", bg: "bg-red-50",     msg: "3 tasks are overdue — review needed",        time: "Yesterday",   unread: false },
 ];
 
 const INIT_UPCOMING = [
@@ -119,12 +92,12 @@ function NavItem({ item, active, onNav }) {
       whileHover={{ x: 3 }}
       whileTap={{ scale: 0.98 }}
       transition={{ duration: 0.15 }}
-      className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[13px] font-medium mb-0.5 transition-all duration-200 ${
+      className={`dashboard-sidebar-item w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[13px] font-medium mb-0.5 transition-all duration-200 ${
         isActive
           ? "text-blue-700 shadow-sm"
           : "text-slate-500 hover:bg-slate-50 hover:text-slate-800"
       }`}
-      style={isActive ? { background: "linear-gradient(135deg, #eff6ff, #eef2ff)" } : {}}
+      data-active={isActive ? "true" : "false"}
     >
       <span className="w-4 text-center text-sm">{item.icon}</span>
       {item.label}
@@ -134,55 +107,333 @@ function NavItem({ item, active, onNav }) {
 }
 
 // ─── Header ────────────────────────────────────────────────────────────────────
-function Header({ onNotif, unreadCount, userName, setActiveNav }) {
-  const shortName = userName?.split(' ')[0] || "User";
-  const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+const THEME_KEY = "meetflow-theme";
+const NOTIFICATION_KEY = "meetflow-notifications";
+
+const getEntityId = (item, fallback) => String(item?._id || item?.id || item?.roomId || item?.joinUrl || fallback);
+
+const parseMeetingDateTime = (meeting) => {
+  if (!meeting) return null;
+
+  if (meeting.date) {
+    const direct = new Date(meeting.date);
+    if (!Number.isNaN(direct.getTime())) return direct;
+  }
+
+  const datePart = meeting.meetingDate || meeting.scheduledDate;
+  const timePart = meeting.time || meeting.meetingTime;
+  if (datePart || timePart) {
+    const composed = new Date(`${datePart || ""} ${timePart || ""}`.trim());
+    if (!Number.isNaN(composed.getTime())) return composed;
+  }
+
+  return null;
+};
+
+const parseTaskDueDate = (task) => {
+  if (!task) return null;
+  const raw = task.deadline || task.dueDate || task.due || task.date;
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const formatDateTime = (dateValue) => {
+  if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return "No date";
+  return dateValue.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+};
+
+const getRelativeTimeLabel = (timestamp, now = new Date()) => {
+  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "just now";
+
+  const diffMs = Math.max(0, now.getTime() - date.getTime());
+  const diffMinutes = Math.floor(diffMs / 60000);
+
+  if (diffMinutes <= 0) return "just now";
+  if (diffMinutes === 1) return "1 minute ago";
+  if (diffMinutes < 60) return `${diffMinutes} minutes ago`;
+
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours === 1) return "1 hour ago";
+  if (diffHours < 24) return `${diffHours} hours ago`;
+
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays === 1) return "1 day ago";
+  return `${diffDays} days ago`;
+};
+
+const highlightMatch = (text, query) => {
+  const source = String(text || "");
+  const q = String(query || "").trim();
+  if (!q) return source;
+
+  const lower = source.toLowerCase();
+  const lowerQ = q.toLowerCase();
+  const parts = [];
+  let index = 0;
+
+  while (index < source.length) {
+    const matchIndex = lower.indexOf(lowerQ, index);
+    if (matchIndex === -1) {
+      parts.push(source.slice(index));
+      break;
+    }
+
+    if (matchIndex > index) {
+      parts.push(source.slice(index, matchIndex));
+    }
+
+    parts.push(
+      <mark
+        key={`${matchIndex}-${lowerQ}`}
+        className="dashboard-highlight"
+      >
+        {source.slice(matchIndex, matchIndex + q.length)}
+      </mark>
+    );
+
+    index = matchIndex + q.length;
+  }
+
+  return parts;
+};
+
+const capitalizeFirst = (value) => {
+  const source = String(value || "").trim();
+  if (!source) return "";
+  return source.charAt(0).toUpperCase() + source.slice(1);
+};
+
+const getDisplayFirstName = (userName, userEmail) => {
+  const candidateName = String(userName || "").trim();
+  if (candidateName) {
+    return capitalizeFirst(candidateName.split(" ")[0]);
+  }
+
+  const emailPrefix = String(userEmail || "").split("@")[0];
+  if (!emailPrefix) return "Guest";
+  return capitalizeFirst(emailPrefix);
+};
+
+const getGreetingByHour = (date = new Date()) => {
+  const hour = date.getHours();
+  if (hour >= 5 && hour < 12) return "Good morning";
+  if (hour >= 12 && hour < 17) return "Good afternoon";
+  if (hour >= 17 && hour < 21) return "Good evening";
+  return "Good night";
+};
+
+function Header({
+  onNotif,
+  unreadCount,
+  userName,
+  userEmail,
+  meetings,
+  tasks,
+  onResultNavigate,
+  theme,
+  onToggleTheme,
+}) {
+  const shortName = getDisplayFirstName(userName, userEmail);
+  const greeting = getGreetingByHour();
+  const dateStr = new Date().toLocaleDateString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchRef = useRef(null);
+
+  const meetingResults = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return [];
+
+    return (meetings || [])
+      .filter((meeting) => {
+        const date = parseMeetingDateTime(meeting);
+        const fields = [
+          meeting?.title,
+          meeting?.roomId,
+          meeting?.joinUrl,
+          meeting?.status,
+          formatDateTime(date),
+        ]
+          .filter(Boolean)
+          .map((value) => String(value).toLowerCase());
+
+        return fields.some((value) => value.includes(query));
+      })
+      .slice(0, 8)
+      .map((meeting) => ({
+        id: getEntityId(meeting, meeting?.title || "meeting"),
+        title: meeting?.title || "Untitled meeting",
+        subtitle: formatDateTime(parseMeetingDateTime(meeting)),
+      }));
+  }, [meetings, searchQuery]);
+
+  const taskResults = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return [];
+
+    return (tasks || [])
+      .filter((task) => {
+        const dueDate = parseTaskDueDate(task);
+        const status = task?.status || (task?.done ? "Completed" : "Pending");
+        const fields = [
+          task?.name,
+          status,
+          formatDateTime(dueDate),
+        ]
+          .filter(Boolean)
+          .map((value) => String(value).toLowerCase());
+
+        return fields.some((value) => value.includes(query));
+      })
+      .slice(0, 8)
+      .map((task) => ({
+        id: getEntityId(task, task?.name || "task"),
+        name: task?.name || "Untitled task",
+        status: task?.status || (task?.done ? "Completed" : "Pending"),
+      }));
+  }, [searchQuery, tasks]);
+
+  const hasQuery = searchQuery.trim().length > 0;
+  const hasResults = meetingResults.length > 0 || taskResults.length > 0;
+
+  useEffect(() => {
+    const handleOutside = (event) => {
+      if (!searchRef.current?.contains(event.target)) {
+        setSearchOpen(false);
+      }
+    };
+
+    const handleEscape = (event) => {
+      if (event.key === "Escape") {
+        setSearchOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleOutside);
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.removeEventListener("mousedown", handleOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, []);
+
+  const handleResultClick = (type, id) => {
+    onResultNavigate?.(type, id);
+    setSearchOpen(false);
+    setSearchQuery("");
+  };
+
   return (
-    <motion.header
-      variants={fadeIn} initial="hidden" animate="visible"
-      className="flex items-center justify-between px-8 py-4 bg-white/90 backdrop-blur-sm border-b border-slate-100/80 sticky top-0 z-10 shadow-[0_1px_12px_rgba(0,0,0,0.04)]"
-    >
+    <motion.header variants={fadeIn} initial="hidden" animate="visible" className="dashboard-topbar">
       <div>
-        <p className="text-[11px] text-slate-400 font-normal tracking-wide">{dateStr}</p>
-        <h1 className="text-[20px] font-semibold text-slate-800 mt-0.5 leading-tight">
-          Good morning, {shortName} 👋
-        </h1>
+        <p className="dashboard-date">{dateStr}</p>
+        <h1 className="dashboard-title">{greeting}, {shortName}</h1>
       </div>
-      <div className="flex items-center gap-2.5">
-        <div className="relative hidden md:block">
-          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">🔍</span>
+
+      <div className="dashboard-topbar-actions">
+        <div className="dashboard-search-wrap" ref={searchRef}>
+          <Search size={16} className="dashboard-search-icon" />
           <input
             type="text"
-            placeholder="Search meetings or tasks..."
-            className="pl-8 pr-4 py-2 text-[12px] border border-slate-200 rounded-xl text-slate-700 placeholder-slate-400 w-56 focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300 transition-all duration-200"
-            style={{ background: "linear-gradient(135deg, #f8faff, #f1f5f9)" }}
+            value={searchQuery}
+            onChange={(event) => {
+              setSearchQuery(event.target.value);
+              setSearchOpen(event.target.value.trim().length > 0);
+            }}
+            onFocus={() => {
+              if (hasQuery) setSearchOpen(true);
+            }}
+            className="dashboard-search-input"
+            aria-label="Search meetings and tasks"
           />
-        </div>
-        <motion.button
-          whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
-          onClick={onNotif}
-          className="relative p-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 transition-all duration-200 shadow-sm"
-        >
-          <span className="text-base">🔔</span>
-          {unreadCount > 0 && (
-            <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full border-2 border-white shadow-sm" />
+
+          {searchOpen && hasQuery && (
+            <div className="dashboard-search-dropdown">
+              {meetingResults.length > 0 && (
+                <div>
+                  <p className="dashboard-section-label">Meetings</p>
+                  <div className="dashboard-results-group">
+                    {meetingResults.map((meeting) => (
+                      <button
+                        key={`meeting-${meeting.id}`}
+                        onClick={() => handleResultClick("meeting", meeting.id)}
+                        className="dashboard-result-row"
+                      >
+                        <p className="dashboard-result-title">{highlightMatch(meeting.title, searchQuery)}</p>
+                        <p className="dashboard-result-subtitle">{highlightMatch(meeting.subtitle, searchQuery)}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {taskResults.length > 0 && (
+                <div>
+                  <p className="dashboard-section-label">Tasks</p>
+                  <div className="dashboard-results-group">
+                    {taskResults.map((task) => (
+                      <button
+                        key={`task-${task.id}`}
+                        onClick={() => handleResultClick("task", task.id)}
+                        className="dashboard-result-row"
+                      >
+                        <div className="dashboard-task-row">
+                          <p className="dashboard-result-title">{highlightMatch(task.name, searchQuery)}</p>
+                          <span className={`dashboard-task-status ${String(task.status).toLowerCase() === "completed" || String(task.status).toLowerCase() === "done" ? "done" : "pending"}`}>
+                            {task.status}
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!hasResults && <p className="dashboard-no-results">No results found</p>}
+            </div>
           )}
-        </motion.button>
+        </div>
+
         <motion.button
-          whileHover={{ scale: 1.02, y: -1 }} whileTap={{ scale: 0.98 }}
-          transition={{ duration: 0.15 }}
-          className="flex items-center gap-2 text-white text-[13px] font-medium px-5 py-2.5 rounded-xl transition-all duration-200 shadow-md hover:shadow-lg"
-          style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={onNotif}
+          className="dashboard-bell-btn"
+          aria-label="Open notifications"
         >
-          <span className="text-base font-light">+</span> Start Meeting
+          <Bell size={16} />
+          {unreadCount > 0 && <span className="dashboard-bell-badge">{unreadCount > 9 ? "9+" : unreadCount}</span>}
         </motion.button>
+
+        <button
+          onClick={onToggleTheme}
+          className="dashboard-theme-toggle"
+          aria-label="Toggle dark and light mode"
+        >
+          <span className={`dashboard-theme-icon ${theme === "light" ? "active" : ""}`}>
+            <Sun size={14} />
+          </span>
+          <span className={`dashboard-theme-icon ${theme === "dark" ? "active" : ""}`}>
+            <Moon size={14} />
+          </span>
+          <span className={`dashboard-theme-thumb ${theme === "dark" ? "dark" : ""}`} />
+        </button>
       </div>
     </motion.header>
   );
 }
 
-// ─── Stats Card ────────────────────────────────────────────────────────────────
 function StatsCard({ stat, delay }) {
+
   return (
     <motion.div
       variants={slideUp(delay)}
@@ -490,77 +741,96 @@ function TaskListCard({ tasks, setTasks, setActiveNav }) {
 }
 
 // ─── Notification Panel ────────────────────────────────────────────────────────
-function NotificationPanel({ open, onClose }) {
-  const [notifs, setNotifs] = useState(NOTIFICATIONS);
-  const unread  = notifs.filter(n => n.unread).length;
-  const markAll = () => setNotifs(ns => ns.map(n => ({ ...n, unread: false })));
+function NotificationPanel({
+  open,
+  notifications,
+  onClose,
+  onMarkAllRead,
+  onItemClick,
+}) {
+  const panelRef = useRef(null);
+  const [timeTick, setTimeTick] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    const intervalId = setInterval(() => setTimeTick(Date.now()), 60000);
+
+    const handleOutside = (event) => {
+      if (!panelRef.current?.contains(event.target)) {
+        onClose?.();
+      }
+    };
+
+    const handleEscape = (event) => {
+      if (event.key === "Escape") {
+        onClose?.();
+      }
+    };
+
+    document.addEventListener("mousedown", handleOutside);
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener("mousedown", handleOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [open, onClose]);
+
+  const sortedNotifications = useMemo(() => {
+    return [...(notifications || [])].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  }, [notifications]);
 
   return (
     <AnimatePresence>
       {open && (
-        <>
-          <motion.div
-            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/10 backdrop-blur-[1px] z-30"
-            onClick={onClose}
-          />
-          <motion.div
-            initial={{ x: 380, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 380, opacity: 0 }}
-            transition={{ type: "tween", duration: 0.3, ease: [0.25, 0.1, 0.25, 1] }}
-            className="fixed top-0 right-0 h-full w-80 bg-white border-l border-slate-100/80 z-40 flex flex-col shadow-2xl"
-          >
-            <div className="px-5 py-4 border-b border-slate-100/80 flex items-center justify-between"
-              style={{ background: "linear-gradient(135deg, #fafbff, #f8faff)" }}>
-              <div className="flex items-center gap-2">
-                <p className="text-[14px] font-semibold text-slate-800">Notifications</p>
-                {unread > 0 && (
-                  <span className="text-[10px] font-bold text-white px-2 py-0.5 rounded-full shadow-sm"
-                    style={{ background: "linear-gradient(135deg, #3b82f6, #6366f1)" }}>
-                    {unread}
-                  </span>
-                )}
-              </div>
-              <button onClick={onClose}
-                className="w-7 h-7 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition">✕</button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {notifs.map(n => (
-                <motion.div key={n.id}
-                  whileHover={{ x: 2 }}
-                  onClick={() => setNotifs(ns => ns.map(x => x.id === n.id ? { ...x, unread: false } : x))}
-                  className={`flex gap-3 p-3 rounded-xl cursor-pointer transition-all duration-200 ${
-                    n.unread
-                      ? "border-l-2 border-blue-500 shadow-sm"
-                      : "bg-slate-50 hover:bg-slate-100"
-                  }`}
-                  style={n.unread ? { background: "linear-gradient(135deg, #eff6ff80, #eef2ff80)" } : {}}>
-                  <div className={`w-9 h-9 rounded-full ${n.bg} flex items-center justify-center text-sm shrink-0 shadow-sm`}>
-                    {n.icon}
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -8 }}
+          transition={{ duration: 0.2 }}
+          ref={panelRef}
+          className="dashboard-notifications-panel"
+        >
+          <div className="dashboard-notifications-head">
+            <h3>Notifications</h3>
+            <button onClick={onMarkAllRead} className="dashboard-mark-read-btn" type="button">
+              Mark All Read
+            </button>
+          </div>
+
+          <div className="dashboard-notifications-list">
+            {sortedNotifications.length === 0 && (
+              <div className="dashboard-all-caught-up">You are all caught up</div>
+            )}
+
+            {sortedNotifications.map((notification) => {
+              const type = notification.type || "info";
+              return (
+                <button
+                  key={notification.id}
+                  className={`dashboard-notification-item type-${type} ${notification.read ? "" : "unread"}`}
+                  onClick={() => onItemClick?.(notification)}
+                  type="button"
+                >
+                  <div className="dashboard-notification-body">
+                    <p className="dashboard-notification-title">{notification.title}</p>
+                    <p className="dashboard-notification-text">{notification.description}</p>
+                    <p className="dashboard-notification-time">{getRelativeTimeLabel(notification.timestamp, new Date(timeTick))}</p>
                   </div>
-                  <div>
-                    <p className="text-[12px] font-medium text-slate-700 leading-relaxed">{n.msg}</p>
-                    <p className="text-[10px] text-slate-400 mt-1 font-medium">{n.time}</p>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
-            <div className="p-4 border-t border-slate-100/80">
-              <button onClick={markAll}
-                className="w-full py-2.5 rounded-xl border border-slate-200 text-[12px] font-semibold text-blue-600 hover:bg-blue-50 hover:border-blue-200 transition-all duration-200">
-                Mark all as read
-              </button>
-            </div>
-          </motion.div>
-        </>
+                </button>
+              );
+            })}
+          </div>
+        </motion.div>
       )}
     </AnimatePresence>
   );
 }
 
-import api from '../api/axios';
-
-// ─── Skeletons ─────────────────────────────────────────────────────────────────
 function StatSkeleton() {
+
   return (
     <div className="bg-slate-50 border border-slate-100/50 rounded-2xl p-6 relative overflow-hidden h-32 animate-pulse">
       <div className="w-16 h-10 bg-slate-200 rounded-lg mb-4" />
@@ -698,12 +968,12 @@ function DashboardContent({ setActiveNav, setCopilotOpen }) {
 
       {/* Today at a Glance Banner */}
       <motion.section variants={slideUp(0.2)}>
-        <div className="rounded-2xl p-8 shadow-sm border border-indigo-100 flex flex-col md:flex-row items-center justify-between gap-6" style={{ background: "linear-gradient(135deg, #eff6ff, #eef2ff)" }}>
+        <div className="dashboard-today-section rounded-2xl p-8 shadow-sm border border-indigo-100 flex flex-col md:flex-row items-center justify-between gap-6">
           <div>
             <h2 className="text-[26px] font-bold text-slate-800 tracking-tight">Today at a glance 👋</h2>
             <p className="text-[15px] text-slate-600 mt-1 font-medium">You have <span className="font-bold text-blue-600">{meetings.length} meetings</span> today and <span className="font-bold text-amber-600">{stats.pendingTasks} pending tasks</span>.</p>
           </div>
-          <div className="bg-white rounded-2xl px-6 py-5 shadow-sm border border-white/50 flex flex-col items-end shrink-0">
+          <div className="dashboard-next-meeting-card rounded-2xl px-6 py-5 shadow-sm border border-white/50 flex flex-col items-end shrink-0">
             <div className="flex items-center gap-2 mb-1.5">
               <span className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Next Meeting</span>
               {meetings.length > 0 && (
@@ -920,165 +1190,7 @@ function CopilotIcon({ size = 18, className = "" }) {
 }
 
 // ─── Copilot Chat Panel ────────────────────────────────────────────────────────
-const COPILOT_SUGGESTIONS = [
-  "Summarize today's meetings",
-  "What tasks are overdue?",
-  "Draft follow-up for Vertex onboarding",
-  "Show my productivity trend",
-];
-
-const COPILOT_RESPONSES = {
-  "Summarize today's meetings": "You have **1 meeting today**: *Q3 Roadmap Review* at 10:00 AM. It focuses on feature releases and sprint priorities for Q3. Attendees: Aryan K., Sara M., Priya R.",
-  "What tasks are overdue?": "You have **3 overdue tasks**:\n• Prepare Q3 executive brief (Mar 23)\n• Update API documentation (Mar 25)\n• Audit task automation workflow (Mar 28)\n\nWant me to draft a quick status update for your team?",
-  "Draft follow-up for Vertex onboarding": "Here's a draft follow-up email for Vertex Corp:\n\n*Subject: Next Steps — Vertex Onboarding*\n\nHi team, thank you for joining today's onboarding session. As a next step, we'll share the integration documentation by EOD Friday. Please feel free to reach out with any questions!",
-  "Show my productivity trend": "Your productivity score is **91%** this week — up 4 points from last week 📈. You've completed 87 tasks and have 14 pending. You're on track for your best month yet!",
-};
-
-function CopilotPanel({ open, onClose }) {
-  const [messages, setMessages] = useState([
-    { role: "assistant", text: "Hi! 👋 I'm your AI Meeting Copilot. How can I help you today?" }
-  ]);
-  const [input, setInput] = useState("");
-  const [typing, setTyping] = useState(false);
-  const bottomRef = { current: null };
-
-  const send = (text) => {
-    if (!text.trim()) return;
-    const userMsg = { role: "user", text };
-    setMessages(m => [...m, userMsg]);
-    setInput("");
-    setTyping(true);
-    setTimeout(() => {
-      const reply = COPILOT_RESPONSES[text] ||
-        "I'm still learning! Try asking me to summarize meetings, check overdue tasks, or draft a follow-up email.";
-      setMessages(m => [...m, { role: "assistant", text: reply }]);
-      setTyping(false);
-    }, 1100);
-  };
-
-  return (
-    <AnimatePresence>
-      {open && (
-        <>
-          <motion.div
-            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/10 backdrop-blur-[1px] z-30"
-            onClick={onClose}
-          />
-          <motion.div
-            initial={{ x: -380, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -380, opacity: 0 }}
-            transition={{ type: "tween", duration: 0.32, ease: [0.25, 0.1, 0.25, 1] }}
-            className="fixed top-0 left-60 h-full w-[360px] z-40 flex flex-col shadow-2xl"
-            style={{ background: "linear-gradient(180deg, #faf7ff 0%, #f0f4ff 100%)" }}
-          >
-            <div className="px-5 py-4 border-b border-violet-100/80 flex items-center justify-between"
-              style={{ background: "linear-gradient(135deg, #f5f3ff, #eff6ff)" }}>
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl flex items-center justify-center shadow-md"
-                  style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb, #06b6d4)" }}>
-                  <CopilotIcon size={20} />
-                </div>
-                <div>
-                  <p className="text-[14px] font-semibold text-slate-800 leading-tight">Meeting Copilot</p>
-                  <div className="flex items-center gap-1.5 mt-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    <span className="text-[10px] text-slate-400 font-medium">AI · Online</span>
-                  </div>
-                </div>
-              </div>
-              <button onClick={onClose}
-                className="w-7 h-7 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-white/80 rounded-lg transition">✕</button>
-            </div>
-
-            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-              {messages.map((msg, i) => (
-                <motion.div
-                  key={i}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.3 }}
-                  className={`flex gap-2.5 ${msg.role === "user" ? "flex-row-reverse" : ""}`}
-                >
-                  {msg.role === "assistant" && (
-                    <div className="w-7 h-7 rounded-full shrink-0 flex items-center justify-center shadow-sm mt-0.5"
-                      style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}>
-                      <CopilotIcon size={14} />
-                    </div>
-                  )}
-                  <div className={`max-w-[80%] px-3.5 py-2.5 rounded-2xl text-[12px] leading-relaxed shadow-sm ${
-                    msg.role === "user"
-                      ? "text-white rounded-tr-sm"
-                      : "bg-white text-slate-700 rounded-tl-sm border border-violet-100/60"
-                  }`}
-                    style={msg.role === "user" ? { background: "linear-gradient(135deg, #7c3aed, #4f46e5)" } : {}}>
-                    {msg.text.split("\n").map((line, j) => (
-                      <React.Fragment key={j}>
-                        {line.replace(/\*\*(.*?)\*\*/g, "$1").replace(/\*(.*?)\*/g, "$1")}
-                        {j < msg.text.split("\n").length - 1 && <br />}
-                      </React.Fragment>
-                    ))}
-                  </div>
-                </motion.div>
-              ))}
-
-              <AnimatePresence>
-                {typing && (
-                  <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-                    className="flex gap-2.5 items-center">
-                    <div className="w-7 h-7 rounded-full shrink-0 flex items-center justify-center shadow-sm"
-                      style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}>
-                      <CopilotIcon size={14} />
-                    </div>
-                    <div className="bg-white px-4 py-2.5 rounded-2xl rounded-tl-sm border border-violet-100/60 shadow-sm flex gap-1 items-center">
-                      {[0, 1, 2].map(i => (
-                        <motion.span key={i} className="w-1.5 h-1.5 rounded-full bg-violet-400"
-                          animate={{ y: [0, -4, 0] }}
-                          transition={{ repeat: Infinity, duration: 0.7, delay: i * 0.15 }} />
-                      ))}
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-              <div ref={el => bottomRef.current = el} />
-            </div>
-
-            <div className="px-4 pb-2 flex gap-1.5 flex-wrap">
-              {COPILOT_SUGGESTIONS.map((s, i) => (
-                <motion.button key={i} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
-                  onClick={() => send(s)}
-                  className="text-[10px] font-medium text-violet-700 bg-violet-50 hover:bg-violet-100 border border-violet-200 px-2.5 py-1 rounded-full transition-colors duration-150">
-                  {s}
-                </motion.button>
-              ))}
-            </div>
-
-            <div className="px-4 pb-4 pt-2">
-              <div className="flex gap-2 items-center bg-white rounded-xl border border-violet-200 px-3 py-2 shadow-sm focus-within:ring-2 focus-within:ring-violet-200 focus-within:border-violet-300 transition-all">
-                <input
-                  value={input}
-                  onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => e.key === "Enter" && send(input)}
-                  placeholder="Ask your Copilot..."
-                  className="flex-1 text-[12px] text-slate-700 placeholder-slate-400 bg-transparent focus:outline-none"
-                />
-                <motion.button
-                  whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}
-                  onClick={() => send(input)}
-                  className="w-7 h-7 rounded-lg flex items-center justify-center text-white shadow-sm transition-opacity"
-                  style={{ background: "linear-gradient(135deg, #7c3aed, #4f46e5)", opacity: input.trim() ? 1 : 0.5 }}
-                >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                </motion.button>
-              </div>
-            </div>
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
-  );
-}
-
-// ─── Skeletons ─────────────────────────────────────────────────────────────────
+// Skeletons ─────────────────────────────────────────────────────────────────
 function TaskSkeleton() {
   return (
     <div className="flex items-center px-6 py-4 animate-pulse">
@@ -1723,319 +1835,370 @@ function MeetingsPage() {
 }
 
 // ─── Profile Page ────────────────────────────────────────────────────────────────
-const TEAMMATES = [
-  { name: "Sara M", role: "Designer", mtgs: 14, color: "bg-rose-50 text-rose-600" },
-  { name: "Priya R", role: "Engineer", mtgs: 11, color: "bg-blue-50 text-blue-600" },
-  { name: "Leo N", role: "Analyst", mtgs: 9, color: "bg-emerald-50 text-emerald-600" },
-  { name: "RC", role: "Client Lead", mtgs: 7, color: "bg-amber-50 text-amber-600" },
-  { name: "TW", role: "Developer", mtgs: 6, color: "bg-violet-50 text-violet-600" }
+const PROFILE_PREFERENCES = [
+  {
+    key: "emailReminders",
+    title: "Email Notifications",
+    description: "Get important meeting and task notifications by email.",
+  },
+  {
+    key: "transcriptionEnabled",
+    title: "Meeting Transcriptions",
+    description: "Automatically create transcripts for your recorded meetings.",
+  },
+  {
+    key: "sendSummaries",
+    title: "AI Daily Summary",
+    description: "Receive a daily AI summary of your latest meeting activity.",
+  },
 ];
 
-const ACTIVITY = [
-  { title: "Q3 Product Roadmap Review", date: "Mar 20", dur: "60 min", border: "border-l-blue-500" },
-  { title: "Design System Sync", date: "Mar 19", dur: "45 min", border: "border-l-violet-500" },
-  { title: "Client Onboarding Vertex", date: "Mar 18", dur: "30 min", border: "border-l-amber-500" },
-  { title: "Engineering Stand Up", date: "Mar 18", dur: "15 min", border: "border-l-emerald-500" },
-  { title: "Sprint Planning", date: "Mar 17", dur: "60 min", border: "border-l-blue-500" },
-];
+const buildInitials = (fullName, email) => {
+  const source = String(fullName || email || "").trim();
+  if (!source) return "U";
+  if (source.includes("@") && !source.includes(" ")) {
+    return source.slice(0, 2).toUpperCase();
+  }
+  return source
+    .split(" ")
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase() || "U";
+};
 
-const INTEGRATIONS = [
-  { name: "Google Calendar", state: "Connected", let: "G", col: "bg-red-50 text-red-600" },
-  { name: "Slack", state: "Connected", let: "S", col: "bg-purple-50 text-purple-600" },
-  { name: "Zoom", state: "Not Connected", let: "Z", col: "bg-blue-50 text-blue-600" },
-  { name: "Jira", state: "Connected", let: "J", col: "bg-blue-50 text-blue-600" },
-  { name: "Notion", state: "Not Connected", let: "N", col: "bg-slate-100 text-slate-600" },
-  { name: "Outlook", state: "Not Connected", let: "O", col: "bg-sky-50 text-sky-600" }
-];
+const hashToHsl = (text) => {
+  const source = String(text || "");
+  let hash = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    hash = source.charCodeAt(index) + ((hash << 5) - hash);
+  }
+  const hue = Math.abs(hash % 360);
+  return `hsl(${hue} 52% 46%)`;
+};
 
-function ProfilePage({ user, updateProfile }) {
+const toDisplayMeetingHours = (minutes) => {
+  const hours = minutes / 60;
+  return Number.isInteger(hours) ? String(hours) : hours.toFixed(1);
+};
+
+function ProfilePage({ user, updateProfile, meetings, tasks }) {
+  const navigate = useNavigate();
+  const [profile, setProfile] = useState(user || null);
   const [isEditing, setIsEditing] = useState(false);
-  const [editName, setEditName] = useState(user?.displayName || "");
-  const [editLoading, setEditLoading] = useState(false);
-  const [profile, setProfile] = useState(null);
-  const [stats, setStats] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [editValues, setEditValues] = useState({
+    fullName: "",
+    jobTitle: "",
+  });
+  const [selectedAvatarFile, setSelectedAvatarFile] = useState(null);
+  const [avatarPreviewUrl, setAvatarPreviewUrl] = useState("");
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
+  const [preferenceSavingKey, setPreferenceSavingKey] = useState("");
 
-  const fetchProfileAndStats = async () => {
-    try {
-      setLoading(true);
-      const [profRes, statRes] = await Promise.all([
-        api.get("/api/user/profile"),
-        api.get("/api/user/stats")
-      ]);
-      setProfile(profRes.data);
-      setStats(statRes.data);
-      setEditName(profRes.data.fullName || user?.displayName || "");
-    } catch(err) { console.error("Error fetching profile", err); }
-    finally { setLoading(false); }
+  useEffect(() => {
+    setProfile(user || null);
+  }, [user]);
+
+  useEffect(() => {
+    return () => {
+      if (avatarPreviewUrl) {
+        URL.revokeObjectURL(avatarPreviewUrl);
+      }
+    };
+  }, [avatarPreviewUrl]);
+
+  const openEditMode = () => {
+    setEditValues({
+      fullName: String(profile?.fullName || "").trim(),
+      jobTitle: String(profile?.jobTitle || "").trim(),
+    });
+    setSelectedAvatarFile(null);
+    setAvatarPreviewUrl("");
+    setIsEditing(true);
   };
 
-  useEffect(() => { fetchProfileAndStats(); }, []);
-
-  const handleTogglePref = async (key) => {
-    if(!profile || !profile.preferences) return;
-    const currentVal = profile.preferences[key];
-    const newPrefs = { ...profile.preferences, [key]: !currentVal };
-    // Optimistic update
-    setProfile({ ...profile, preferences: newPrefs });
-    try {
-      await api.patch("/api/user/profile", { preferences: newPrefs });
-    } catch (err) {
-      console.error("Failed to update preference", err);
-      setProfile({ ...profile, preferences: { ...profile.preferences, [key]: currentVal }});
-    }
-  };
-
-  const PREF_MAP = [
-    { key: "emailReminders", title: "Email Notifications", desc: "Receive immediate emails for task deadlines meetings.", default: true },
-    { key: "transcriptionEnabled", title: "Meeting Transcriptions", desc: "Enable AI transcription for all meetings.", default: false },
-    { key: "sendSummaries", title: "AI Daily Summary", desc: "Let Copilot send you an automatic summary every evening.", default: false },
-    { key: "recurringDefault", title: "Recurring Default", desc: "Set new meetings as recurring by default.", default: false },
-    { key: "autoRecord", title: "Auto Record Meetings", desc: "Automatically record all scheduled meetings.", default: true },
-  ];
-
-  const nameToDisplay = profile?.fullName || user?.displayName || "User";
-  const initials = profile?.avatarInitials || nameToDisplay.split(' ').map(n=>n[0]).join('').substring(0,2).toUpperCase() || "U";
-
-  const handleSaveProfile = async () => {
-    if (!editName.trim()) return;
-    setEditLoading(true);
-    try {
-      const res = await api.patch("/api/user/profile", { fullName: editName });
-      setProfile(res.data);
-      if(updateProfile) await updateProfile(editName);
-    } catch(err) { console.error(err); }
-    setEditLoading(false);
+  const closeEditMode = () => {
+    setSelectedAvatarFile(null);
+    setAvatarPreviewUrl("");
     setIsEditing(false);
   };
 
-  if (loading) return (
-     <div className="flex justify-center py-20"><div className="w-8 h-8 rounded-full border-4 border-slate-200 border-t-blue-600 animate-spin" /></div>
-  );
+  const handleAvatarChange = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setSelectedAvatarFile(file);
+    const localPreview = URL.createObjectURL(file);
+    setAvatarPreviewUrl(localPreview);
+  };
+
+  const uploadAvatarFile = async (file) => {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("Failed to read selected image."));
+      reader.readAsDataURL(file);
+    });
+
+    const response = await api.post("/api/user/avatar", {
+      imageData: dataUrl,
+      fileName: file.name,
+    });
+
+    return response.data;
+  };
+
+  const handleSaveProfile = async () => {
+    const nextName = String(editValues.fullName || "").trim();
+    if (!nextName) return;
+
+    setIsSavingProfile(true);
+    try {
+      let updates = {
+        fullName: nextName,
+        jobTitle: String(editValues.jobTitle || "").trim(),
+      };
+
+      if (selectedAvatarFile) {
+        const avatarResponse = await uploadAvatarFile(selectedAvatarFile);
+        if (avatarResponse?.avatarUrl) {
+          updates = { ...updates, avatarUrl: avatarResponse.avatarUrl };
+        }
+      }
+
+      const result = await updateProfile(updates);
+      if (result?.success && result?.user) {
+        setProfile(result.user);
+        closeEditMode();
+      }
+    } catch (error) {
+      console.error("Failed to save profile", error);
+    } finally {
+      setIsSavingProfile(false);
+    }
+  };
+
+  const handleTogglePreference = async (key) => {
+    if (!profile) return;
+
+    const currentPreferences = profile.preferences || {};
+    const nextValue = !Boolean(currentPreferences[key]);
+    const nextPreferences = { ...currentPreferences, [key]: nextValue };
+
+    setPreferenceSavingKey(key);
+    const previousProfile = profile;
+    setProfile({ ...profile, preferences: nextPreferences });
+
+    try {
+      const result = await updateProfile({ preferences: nextPreferences });
+      if (result?.success && result?.user) {
+        setProfile(result.user);
+      } else {
+        setProfile(previousProfile);
+      }
+    } catch (error) {
+      console.error("Failed to update preference", error);
+      setProfile(previousProfile);
+    } finally {
+      setPreferenceSavingKey("");
+    }
+  };
+
+  const stats = useMemo(() => {
+    const safeMeetings = Array.isArray(meetings) ? meetings : [];
+    const safeTasks = Array.isArray(tasks) ? tasks : [];
+
+    const totalMeetings = safeMeetings.length;
+    const totalMeetingMinutes = safeMeetings.reduce((sum, meeting) => {
+      const duration = Number(meeting?.duration);
+      return sum + (Number.isFinite(duration) ? duration : 0);
+    }, 0);
+
+    const completedTasks = safeTasks.filter((task) => {
+      const status = String(task?.status || "").toLowerCase();
+      return status === "done" || status === "completed";
+    }).length;
+
+    const totalTasks = safeTasks.length;
+    const productivityScore = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+
+    return {
+      totalMeetings,
+      totalMeetingMinutes,
+      completedTasks,
+      totalTasks,
+      productivityScore,
+    };
+  }, [meetings, tasks]);
+
+  const recentMeetings = useMemo(() => {
+    const safeMeetings = Array.isArray(meetings) ? meetings : [];
+
+    return [...safeMeetings]
+      .map((meeting) => ({ meeting, parsedDate: parseMeetingDateTime(meeting) }))
+      .sort((left, right) => {
+        const leftValue = left.parsedDate?.getTime() || 0;
+        const rightValue = right.parsedDate?.getTime() || 0;
+        return rightValue - leftValue;
+      })
+      .slice(0, 4);
+  }, [meetings]);
+
+  const displayName = String(profile?.fullName || profile?.email || "").trim();
+  const displayEmail = String(profile?.email || "").trim();
+  const displayRole = String(profile?.jobTitle || "").trim();
+  const initials = buildInitials(displayName, displayEmail);
+  const avatarColor = hashToHsl(displayName || displayEmail);
+  const avatarSrc = avatarPreviewUrl || profile?.avatarUrl || "";
 
   return (
-    <motion.div variants={stagger} initial="hidden" animate="visible" className="max-w-[900px] mx-auto space-y-8 pb-10">
-      
-      {/* Hero Card */}
-      <motion.div variants={slideUp(0)} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow overflow-hidden relative">
-        <div className="h-32 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-600 relative">
-          <div className="absolute inset-0 opacity-20 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4IiBoZWlnaHQ9IjgiPgo8cmVjdCB3aWR0aD0iOCIgaGVpZ2h0PSI4IiBmaWxsPSIjZmZmIiBmaWxsLW9wYWNpdHk9IjAuMSI+PC9yZWN0Pgo8cGF0aCBkPSJNMCAwTDggOFpNOCAwTDAgOFoiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLW9wYWNpdHk9IjAuMiIgc3Ryb2tlLXdpZHRoPSIxIj48L3BhdGg+Cjwvc3ZnPg==')]"></div>
-        </div>
-        <div className="px-8 pb-8 flex flex-col sm:flex-row items-center sm:items-end gap-6 -mt-12 relative z-10">
-          <div className="w-24 h-24 rounded-2xl bg-white border-4 border-white shadow-md flex items-center justify-center text-3xl font-bold text-blue-700"
-               style={{ background: "linear-gradient(135deg, #dbeafe, #c7d2fe)" }}>
-            {initials}
-          </div>
-          <div className="flex-1 text-center sm:text-left">
-            <div className="flex items-center justify-center sm:justify-start gap-2">
-              <h2 className="text-[24px] font-bold text-slate-800 tracking-tight">{nameToDisplay}</h2>
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-sm border border-white"></span>
-            </div>
-            <p className="text-[13px] font-medium text-slate-500 mt-1">
-              {profile?.jobTitle || "Product Manager"} - {profile?.department || "Engineering"} - {profile?.company || "Company"}
-            </p>
-            <p className="text-[12px] text-slate-400 mt-0.5 font-medium">
-              {profile?.phone || "No phone added"} - {profile?.timezone || "UTC"}
-            </p>
-          </div>
-          <div className="flex gap-3 mt-4 sm:mt-0">
-            <motion.button onClick={() => setIsEditing(!isEditing)} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} className="px-5 py-2 text-[12px] font-semibold bg-slate-50 border border-slate-200 text-slate-600 hover:bg-slate-100 rounded-xl transition-colors">
-              {isEditing ? "Cancel Edit" : "Edit Details"}
-            </motion.button>
-            <motion.button whileHover={{ scale: 1.05, y: -1 }} whileTap={{ scale: 0.95 }} className="px-5 py-2 text-[12px] font-semibold text-white shadow-sm hover:shadow-md rounded-xl transition-all" style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-              Share Profile
-            </motion.button>
-          </div>
-        </div>
+    <motion.div variants={stagger} initial="hidden" animate="visible" className="profile-page-shell">
+      <motion.section variants={slideUp(0)} className="profile-card profile-header-card">
+        <div className="profile-header-content">
+          <div className="profile-avatar-wrap">
+            {avatarSrc ? (
+              <img src={avatarSrc} alt={displayName} className="profile-avatar" />
+            ) : (
+              <div className="profile-avatar profile-avatar-fallback" style={{ backgroundColor: avatarColor }}>
+                {initials}
+              </div>
+            )}
 
-        <AnimatePresence>
-          {isEditing && (
-            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="border-t border-slate-100 bg-slate-50/50 px-8 py-5">
-              <h3 className="text-[13px] font-bold text-slate-800 mb-3">Update Identity</h3>
-              <div className="flex items-center gap-3">
-                <input type="text" value={editName} onChange={e => setEditName(e.target.value)} placeholder="Full Name" className="px-4 py-2 text-[13px] border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400 min-w-[250px]" />
-                <button onClick={handleSaveProfile} disabled={editLoading} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-[12px] font-semibold rounded-xl shadow-sm disabled:opacity-50">
-                  {editLoading ? "Saving" : "Save Changes"}
+            {isEditing && (
+              <label className="profile-avatar-upload">
+                Upload
+                <input type="file" accept="image/png,image/jpeg,image/webp,image/jpg" onChange={handleAvatarChange} />
+              </label>
+            )}
+          </div>
+
+          <div className="profile-header-text">
+            {isEditing ? (
+              <div className="profile-edit-fields">
+                <input
+                  type="text"
+                  value={editValues.fullName}
+                  onChange={(event) => setEditValues((prev) => ({ ...prev, fullName: event.target.value }))}
+                  className="profile-edit-input"
+                />
+                <p className="profile-header-email">{displayEmail}</p>
+                <input
+                  type="text"
+                  value={editValues.jobTitle}
+                  onChange={(event) => setEditValues((prev) => ({ ...prev, jobTitle: event.target.value }))}
+                  className="profile-edit-input profile-edit-role"
+                />
+              </div>
+            ) : (
+              <>
+                <h2 className="profile-header-name">{displayName}</h2>
+                <p className="profile-header-email">{displayEmail}</p>
+                {displayRole && <p className="profile-header-role">{displayRole}</p>}
+              </>
+            )}
+          </div>
+
+          <div className="profile-header-actions">
+            {!isEditing ? (
+              <button className="profile-header-button" onClick={openEditMode}>
+                Edit Profile
+              </button>
+            ) : (
+              <div className="profile-edit-actions">
+                <button className="profile-save-button" onClick={handleSaveProfile} disabled={isSavingProfile}>
+                  {isSavingProfile ? "Saving..." : "Save"}
+                </button>
+                <button className="profile-cancel-button" onClick={closeEditMode} disabled={isSavingProfile}>
+                  Cancel
                 </button>
               </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
-
-      {/* Productivity Stats Grid */}
-      <section>
-        <motion.p variants={slideUp(0.05)} className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mx-2 mb-3">Productivity Stats</motion.p>
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <motion.div variants={slideUp(0.1)} whileHover={{ scale: 1.02, y: -2 }} className="bg-blue-50 rounded-2xl p-4 border border-blue-100/50 shadow-sm hover:shadow-md transition-shadow">
-            <p className="text-[28px] font-bold text-blue-700 leading-none">{stats?.totalMeetings || 0}</p>
-            <p className="text-[11px] font-semibold text-blue-600 mt-2">Total Meetings Handled</p>
-          </motion.div>
-          <motion.div variants={slideUp(0.15)} whileHover={{ scale: 1.02, y: -2 }} className="bg-amber-50 rounded-2xl p-4 border border-amber-100/50 shadow-sm hover:shadow-md transition-shadow">
-             <p className="text-[28px] font-bold text-amber-700 leading-none">{(stats?.totalMeetings ? (stats.totalMeetings * 45) / 60 : 0).toFixed(1)} hrs</p>
-             <p className="text-[11px] font-semibold text-amber-600 mt-2">Est. Meeting Hours</p>
-          </motion.div>
-          <motion.div variants={slideUp(0.25)} whileHover={{ scale: 1.02, y: -2 }} className="bg-violet-50 rounded-2xl p-4 border border-violet-100/50 shadow-sm hover:shadow-md transition-shadow">
-             <p className="text-[28px] font-bold text-violet-700 leading-none">{stats?.completedTasks || 0}/{((stats?.pendingTasks||0)+(stats?.completedTasks||0))}</p>
-             <p className="text-[11px] font-semibold text-violet-600 mt-2">Tasks Completed</p>
-          </motion.div>
-          <motion.div variants={slideUp(0.3)} whileHover={{ scale: 1.02, y: -2 }} className="bg-emerald-50 rounded-2xl p-4 border border-emerald-100/50 shadow-sm hover:shadow-md transition-shadow">
-             <p className="text-[24px] font-bold text-emerald-700 leading-none">{stats?.productivityScore || 85}%</p>
-             <p className="text-[11px] font-semibold text-emerald-600 mt-2">Productivity Score</p>
-          </motion.div>
+            )}
+          </div>
         </div>
-      </section>
+      </motion.section>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className="md:col-span-1 space-y-6">
-          {/* Work Style */}
-          <motion.div variants={slideUp(0.35)} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow p-6">
-            <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-5">Work Style</h3>
-            <div className="space-y-5">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 shrink-0 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold text-[14px]">HF</div>
-                <div>
-                  <p className="text-[13px] font-semibold text-slate-800">Highly Focused</p>
-                  <p className="text-[11px] text-slate-500">Completes tasks on time</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 shrink-0 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center font-bold text-[14px]">AC</div>
-                <div>
-                  <p className="text-[13px] font-semibold text-slate-800">Active Communicator</p>
-                  <p className="text-[11px] text-slate-500">Attends most team syncs</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 shrink-0 rounded-lg bg-violet-50 text-violet-600 flex items-center justify-center font-bold text-[14px]">ST</div>
-                <div>
-                  <p className="text-[13px] font-semibold text-slate-800">Strategic Thinker</p>
-                  <p className="text-[11px] text-slate-500">Plans 3 meetings per week</p>
-                </div>
-              </div>
-            </div>
-            <div className="mt-6 pt-5 border-t border-slate-100 flex flex-wrap gap-2">
-               <span className="text-[10px] font-semibold tracking-wide bg-slate-50 border border-slate-200 text-slate-600 px-3 py-1 rounded-full">Product</span>
-               <span className="text-[10px] font-semibold tracking-wide bg-slate-50 border border-slate-200 text-slate-600 px-3 py-1 rounded-full">Engineering</span>
-               <span className="text-[10px] font-semibold tracking-wide bg-slate-50 border border-slate-200 text-slate-600 px-3 py-1 rounded-full">+3 tags</span>
-            </div>
-          </motion.div>
-
-          {/* Recent Meeting Activity */}
-          <motion.div variants={slideUp(0.4)} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow overflow-hidden">
-             <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50">
-               <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Recent Meeting Activity</h3>
-             </div>
-             <div className="divide-y divide-slate-50">
-               {ACTIVITY.map((m, i) => (
-                 <div key={i} className={`px-5 py-4 border-l-4 ${m.border} hover:bg-slate-50 transition-colors flex items-center justify-between`}>
-                   <div className="min-w-0 pr-3">
-                     <p className="text-[12px] font-semibold text-slate-800 truncate">{m.title}</p>
-                     <p className="text-[10px] font-medium text-slate-500 mt-0.5">{m.date} - {m.dur}</p>
-                   </div>
-                   <button className="text-[10px] font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 px-2.5 py-1.5 rounded-lg transition-colors shrink-0">
-                     View Summary
-                   </button>
-                 </div>
-               ))}
-             </div>
-          </motion.div>
+      <motion.section variants={slideUp(0.05)} className="profile-stats-grid">
+        <div className="profile-stat-card">
+          <p className="profile-stat-value">{stats.totalMeetings}</p>
+          <p className="profile-stat-label">TOTAL MEETINGS</p>
         </div>
-
-        <div className="md:col-span-2 space-y-6">
-           {/* Top Teammates */}
-           <motion.div variants={slideUp(0.45)} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow p-6">
-              <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-5">Top Teammates</h3>
-              <div className="flex gap-4 overflow-x-auto pb-2 -mx-2 px-2 snap-x">
-                {TEAMMATES.map((tm, i) => (
-                  <motion.div key={i} whileHover={{ scale: 1.05 }} className="min-w-[124px] snap-center bg-slate-50 border border-slate-100 rounded-xl p-4 flex flex-col items-center justify-center text-center">
-                    <div className={`w-14 h-14 rounded-full flex items-center justify-center text-[16px] font-bold ${tm.color} mb-3 shadow-sm border-2 border-white`}>
-                      {tm.name.split(' ').map(n=>n[0]).join('')}
-                    </div>
-                    <p className="text-[12px] font-bold text-slate-800">{tm.name}</p>
-                    <p className="text-[10px] font-semibold text-slate-500 mb-2 mt-0.5">{tm.role}</p>
-                    <span className="text-[10px] font-bold bg-white text-slate-600 border border-slate-200 px-3 py-1 rounded-full">{tm.mtgs} Meetings</span>
-                  </motion.div>
-                ))}
-              </div>
-           </motion.div>
-
-           {/* Account Preferences */}
-           <motion.div variants={slideUp(0.5)} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow overflow-hidden">
-              <div className="px-6 py-5 border-b border-slate-100 bg-slate-50/50">
-                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Account Preferences</h3>
-              </div>
-              <div className="divide-y divide-slate-50">
-                {PREF_MAP.map((setting) => {
-                  const isActive = profile?.preferences?.[setting.key] ?? setting.default;
-                  return (
-                  <div key={setting.key} className="px-6 py-4 flex items-center justify-between hover:bg-slate-50 transition-colors">
-                    <div>
-                      <p className="text-[12px] font-bold text-slate-800">{setting.title}</p>
-                      <p className="text-[11px] font-medium text-slate-500 mt-0.5">{setting.desc}</p>
-                    </div>
-                    <div onClick={() => handleTogglePref(setting.key)} className={`w-10 h-6 flex items-center rounded-full p-1 cursor-pointer transition-colors ${isActive ? "bg-blue-600" : "bg-slate-300"}`}>
-                      <motion.div layout className="bg-white w-4 h-4 rounded-full shadow-sm" animate={{ x: isActive ? 16 : 0 }} transition={{ type: "spring", stiffness: 500, damping: 30 }} />
-                    </div>
-                  </div>
-                )})}
-              </div>
-           </motion.div>
-
-
-
-           {/* Account & Security */}
-           <motion.div variants={slideUp(0.6)} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow overflow-hidden">
-              <div className="px-6 py-5 border-b border-slate-100 bg-slate-50/50">
-                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Account and Security</h3>
-              </div>
-              <div className="divide-y divide-slate-50">
-                <div className="px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50 transition-colors">
-                  <div>
-                    <p className="text-[12px] font-bold text-slate-800">Change Password</p>
-                    <p className="text-[11px] font-medium text-slate-500 mt-0.5">Last changed 3 months ago</p>
-                  </div>
-                  <button className="text-[11px] font-bold bg-slate-50 hover:bg-slate-100 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl transition-colors">Update</button>
-                </div>
-                <div className="px-6 py-4 flex items-center justify-between hover:bg-slate-50 transition-colors">
-                  <div>
-                    <p className="text-[12px] font-bold text-slate-800">Two Factor Authentication</p>
-                    <p className="text-[11px] font-medium text-slate-500 mt-0.5">Secure your account</p>
-                  </div>
-                  <div className="bg-emerald-50 text-emerald-600 text-[10px] font-bold px-3 py-1.5 rounded-full border border-emerald-100">Enabled</div>
-                </div>
-                <div className="px-6 py-5">
-                  <p className="text-[12px] font-bold text-slate-800 mb-3">Active Sessions</p>
-                  <div className="space-y-3">
-                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50 p-4 rounded-xl border border-slate-100">
-                        <div>
-                          <p className="text-[12px] font-bold text-slate-700">Chrome on MacBook</p>
-                          <p className="text-[11px] font-medium text-slate-400 mt-0.5">Current Session</p>
-                        </div>
-                        <button className="text-[11px] font-bold bg-white border border-slate-200 text-slate-500 hover:bg-slate-100 px-4 py-2 rounded-lg transition-colors">Revoke</button>
-                     </div>
-                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50 p-4 rounded-xl border border-slate-100">
-                        <div>
-                          <p className="text-[12px] font-bold text-slate-700">Mobile App on iPhone 14</p>
-                          <p className="text-[11px] font-medium text-slate-400 mt-0.5">Last active 2 hrs ago</p>
-                        </div>
-                        <button className="text-[11px] font-bold bg-white border border-slate-200 text-slate-500 hover:bg-slate-100 px-4 py-2 rounded-lg transition-colors">Revoke</button>
-                     </div>
-                  </div>
-                </div>
-              </div>
-              <div className="p-6 bg-slate-50 border-t border-slate-200 flex flex-wrap gap-4">
-                <button className="flex-1 text-[13px] font-bold bg-red-50 text-red-600 hover:bg-red-100 border border-red-100 px-4 py-3 rounded-xl transition-colors text-center shadow-sm">Export My Data</button>
-                <button className="flex-1 text-[13px] font-bold bg-red-600 text-white hover:bg-red-700 shadow-md px-4 py-3 rounded-xl transition-colors text-center">Delete Account</button>
-              </div>
-           </motion.div>
+        <div className="profile-stat-card">
+          <p className="profile-stat-value">{toDisplayMeetingHours(stats.totalMeetingMinutes)}</p>
+          <p className="profile-stat-label">MEETING HOURS</p>
         </div>
-      </div>
+        <div className="profile-stat-card">
+          <p className="profile-stat-value">{stats.completedTasks}/{stats.totalTasks}</p>
+          <p className="profile-stat-label">TASKS COMPLETED</p>
+        </div>
+        <div className="profile-stat-card">
+          <p className="profile-stat-value">{stats.productivityScore}%</p>
+          <p className="profile-stat-label">PRODUCTIVITY SCORE</p>
+        </div>
+      </motion.section>
+
+      <motion.section variants={slideUp(0.1)} className="profile-card">
+        <h3 className="profile-section-title">Recent Activity</h3>
+        {recentMeetings.length === 0 ? (
+          <p className="profile-empty-state">No meeting activity yet.</p>
+        ) : (
+          <div className="profile-activity-list">
+            {recentMeetings.map(({ meeting, parsedDate }) => {
+              const meetingId = getEntityId(meeting, meeting?.title || "meeting");
+              return (
+                <div className="profile-activity-row" key={meetingId}>
+                  <div className="profile-activity-copy">
+                    <p className="profile-activity-title">{meeting?.title || ""}</p>
+                    <p className="profile-activity-date">
+                      {parsedDate ? parsedDate.toLocaleDateString([], { dateStyle: "medium" }) : ""}
+                    </p>
+                  </div>
+                  <button
+                    className="profile-summary-link"
+                    onClick={() => navigate(`/meetings/${encodeURIComponent(meetingId)}`)}
+                  >
+                    View Summary
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </motion.section>
+
+      <motion.section variants={slideUp(0.15)} className="profile-card">
+        <h3 className="profile-section-title">Preferences</h3>
+        <div className="profile-pref-list">
+          {PROFILE_PREFERENCES.map((item) => {
+            const isActive = Boolean(profile?.preferences?.[item.key]);
+            const isSaving = preferenceSavingKey === item.key;
+
+            return (
+              <div className="profile-pref-row" key={item.key}>
+                <div className="profile-pref-copy">
+                  <p className="profile-pref-title">{item.title}</p>
+                  <p className="profile-pref-desc">{item.description}</p>
+                </div>
+
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={isActive}
+                  className={`profile-pref-toggle ${isActive ? "is-on" : ""}`}
+                  onClick={() => handleTogglePreference(item.key)}
+                  disabled={isSaving}
+                >
+                  <span className="profile-pref-thumb" />
+                  {isSaving && <span className="profile-toggle-loader" />}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </motion.section>
     </motion.div>
   );
 }
 
-// ─── Reports Page ──────────────────────────────────────────────────────────────
 function ReportsPage() {
   const [filter, setFilter] = useState("This Week");
   const tabs = ["This Week", "This Month", "Last 3 Months", "All Time"];
@@ -2657,47 +2820,240 @@ function SettingsPage() {
 }
 
 export default function Dashboard({ user, handleSignOut }) {
-
   const { updateProfile } = useAuth();
+  const { meetings: allMeetings, tasks: allTasks, refreshData } = useAppData();
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const [activeNav, setActiveNav] = useState("dashboard");
   const [notifOpen, setNotifOpen] = useState(false);
   const [copilotOpen, setCopilotOpen] = useState(false);
-  const unreadCount = NOTIFICATIONS.filter(n => n.unread).length;
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === "undefined") return "light";
+    return localStorage.getItem(THEME_KEY) || document.documentElement.getAttribute("data-theme") || "light";
+  });
+  const [notifications, setNotifications] = useState(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const saved = JSON.parse(localStorage.getItem(NOTIFICATION_KEY) || "[]");
+      return Array.isArray(saved) ? saved : [];
+    } catch (_) {
+      return [];
+    }
+  });
+
+  const previousTaskStatusesRef = useRef(new Map());
+
+  useEffect(() => {
+    const normalized = theme === "dark" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", normalized);
+    localStorage.setItem(THEME_KEY, normalized);
+  }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(NOTIFICATION_KEY, JSON.stringify(notifications));
+  }, [notifications]);
+
+  const appendNotification = useCallback((next) => {
+    setNotifications((current) => {
+      if (current.some((item) => item.key === next.key)) return current;
+
+      return [
+        {
+          id: next.key,
+          title: next.title,
+          description: next.description,
+          type: next.type,
+          timestamp: new Date().toISOString(),
+          read: false,
+          entityType: next.entityType,
+          entityId: next.entityId,
+          key: next.key,
+        },
+        ...current,
+      ];
+    });
+  }, []);
+
+  const evaluateSmartNotifications = useCallback((meetings, tasks) => {
+    const now = new Date();
+
+    (meetings || []).forEach((meeting) => {
+      const entityId = getEntityId(meeting, meeting?.title || "meeting");
+      const start = parseMeetingDateTime(meeting);
+      if (!start) return;
+
+      const minutesUntilStart = Math.round((start.getTime() - now.getTime()) / 60000);
+
+      if (minutesUntilStart >= 10 && minutesUntilStart <= 15) {
+        appendNotification({
+          key: `meeting-${entityId}-soon-15`,
+          title: "Meeting starts soon",
+          description: `${meeting.title || "Meeting"} starts in ${minutesUntilStart} minutes`,
+          type: "warning",
+          entityType: "meeting",
+          entityId,
+        });
+      }
+
+      if (minutesUntilStart >= 55 && minutesUntilStart <= 65) {
+        appendNotification({
+          key: `meeting-${entityId}-hour`,
+          title: "Meeting in about 1 hour",
+          description: `${meeting.title || "Meeting"} is scheduled at ${start.toLocaleTimeString([], { timeStyle: "short" })}`,
+          type: "info",
+          entityType: "meeting",
+          entityId,
+        });
+      }
+
+      if (minutesUntilStart >= -2 && minutesUntilStart <= 2) {
+        appendNotification({
+          key: `meeting-${entityId}-live`,
+          title: "Meeting is live",
+          description: `${meeting.title || "Meeting"} is live now. Join now.`,
+          type: "success",
+          entityType: "meeting",
+          entityId,
+        });
+      }
+    });
+
+    const nextTaskStatuses = new Map();
+
+    (tasks || []).forEach((task) => {
+      const entityId = getEntityId(task, task?.name || "task");
+      const statusText = String(task?.status || (task?.done ? "Completed" : "Pending")).toLowerCase();
+      const isCompleted = statusText === "done" || statusText === "completed";
+      const dueDate = parseTaskDueDate(task);
+      const dueAtMidnight = dueDate ? new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate()) : null;
+      const nowMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+      if (!isCompleted && dueAtMidnight) {
+        if (dueAtMidnight.getTime() === nowMidnight.getTime()) {
+          appendNotification({
+            key: `task-${entityId}-due-today`,
+            title: "Task due today",
+            description: `${task.name || "Task"} is due today`,
+            type: "warning",
+            entityType: "task",
+            entityId,
+          });
+        }
+
+        if (dueAtMidnight.getTime() < nowMidnight.getTime()) {
+          appendNotification({
+            key: `task-${entityId}-overdue`,
+            title: "Task overdue",
+            description: `${task.name || "Task"} is overdue`,
+            type: "danger",
+            entityType: "task",
+            entityId,
+          });
+        }
+      }
+
+      const previousStatus = previousTaskStatusesRef.current.get(entityId);
+      if (previousStatus && previousStatus !== "completed" && isCompleted) {
+        appendNotification({
+          key: `task-${entityId}-completed`,
+          title: "Task completed",
+          description: `${task.name || "Task"} was completed`,
+          type: "success",
+          entityType: "task",
+          entityId,
+        });
+      }
+
+      nextTaskStatuses.set(entityId, isCompleted ? "completed" : "pending");
+    });
+
+    previousTaskStatusesRef.current = nextTaskStatuses;
+  }, [appendNotification]);
+
+  useEffect(() => {
+    evaluateSmartNotifications(allMeetings, allTasks);
+  }, [allMeetings, allTasks, evaluateSmartNotifications]);
+
+  useEffect(() => {
+    refreshData();
+    const intervalId = setInterval(refreshData, 60000);
+    return () => clearInterval(intervalId);
+  }, [refreshData]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const tab = params.get("tab");
+    if (tab && NAV.some((item) => item.id === tab)) {
+      setActiveNav(tab);
+    }
+  }, [location.search]);
+
+  const goToEntity = useCallback((entityType, entityId) => {
+    if (entityType === "task") {
+      navigate(`/tasks/${encodeURIComponent(entityId)}`);
+      return;
+    }
+    navigate(`/meetings/${encodeURIComponent(entityId)}`);
+  }, [navigate]);
+
+  const handleNotificationClick = useCallback((notification) => {
+    setNotifications((current) => current.map((item) => (item.id === notification.id ? { ...item, read: true } : item)));
+    setNotifOpen(false);
+    if (notification.entityType === "meeting" || notification.entityType === "task") {
+      goToEntity(notification.entityType, notification.entityId);
+    }
+  }, [goToEntity]);
+
+  const unreadCount = notifications.filter((item) => !item.read).length;
 
   const renderPage = () => {
     switch (activeNav) {
-      case "dashboard": return <DashboardContent setActiveNav={setActiveNav} setCopilotOpen={setCopilotOpen} />;
-      case "tasks": return <TasksPage />;
-      case "meetings": return <MeetingsPage />;
-      case "profile": return <ProfilePage user={user} updateProfile={updateProfile} />;
-      case "reports": return <ReportsPage />;
-      case "settings": return <SettingsPage />;
-      default:
-        const item = NAV.find(n => n.id === activeNav);
-        return <PlaceholderPage label={item?.label ?? activeNav} icon={item?.icon ?? "📄"} />;
+      case "dashboard":
+        return <DashboardContent setActiveNav={setActiveNav} setCopilotOpen={setCopilotOpen} />;
+      case "tasks":
+        return <TasksPage />;
+      case "meetings":
+        return <MeetingsPage />;
+      case "profile":
+        return <ProfilePage user={user} updateProfile={updateProfile} meetings={allMeetings} tasks={allTasks} />;
+      case "reports":
+        return <ReportsPage />;
+      case "settings":
+        return <SettingsPage />;
+      default: {
+        const item = NAV.find((navItem) => navItem.id === activeNav);
+        return <PlaceholderPage label={item?.label ?? activeNav} icon={item?.icon ?? "Doc"} />;
+      }
     }
   };
 
-  const shortName = user?.displayName ? user.displayName.split(' ')[0] : "User";
-  const initials = user?.displayName ? user.displayName.split(' ').map(n=>n[0]).join('').substring(0,2).toUpperCase() : "U";
+  const rawUserName = user?.fullName || user?.displayName || "";
+  const initialsSource = user?.fullName || user?.displayName || user?.email || "U";
+  const initials = initialsSource
+    ? initialsSource
+        .split(" ")
+        .map((part) => part[0])
+        .join("")
+        .substring(0, 2)
+        .toUpperCase()
+    : "U";
 
   return (
-    <div className="min-h-screen text-slate-800" style={{ background: "linear-gradient(160deg, #f0f4ff 0%, #f8fafc 50%, #f0fff4 100%)", fontFamily: "'Google Sans', sans-serif" }}>
+    <div className="min-h-screen dashboard-theme dashboard-root">
       <motion.aside
         initial={{ x: -24, opacity: 0 }}
         animate={{ x: 0, opacity: 1 }}
         transition={{ duration: 0.45, ease: [0.25, 0.1, 0.25, 1] }}
-        style={{ background: "linear-gradient(180deg, #ffffff 0%, #fafbff 100%)" }}
         className="fixed top-0 left-0 h-full w-60 border-r border-slate-100/80 flex flex-col z-20 shadow-[1px_0_20px_rgba(0,0,0,0.04)]"
       >
         <div className="px-5 py-5 border-b border-slate-100/80">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl flex items-center justify-center shadow-md shrink-0"
-              style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-              <span className="text-white text-sm font-bold">S</span>
+            <div className="w-9 h-9 rounded-xl flex items-center justify-center shadow-md shrink-0" style={{ background: "var(--color-primary)" }}>
+              <span className="text-white text-sm font-bold">C</span>
             </div>
             <div>
-              <div className="text-[13px] font-semibold text-slate-800 leading-tight">Smart Meeting</div>
+              <div className="text-[13px] font-semibold text-slate-800 leading-tight">Clarix</div>
               <div className="text-[10px] text-slate-400 font-normal leading-tight mt-0.5">Intelligence System</div>
             </div>
           </div>
@@ -2705,9 +3061,9 @@ export default function Dashboard({ user, handleSignOut }) {
 
         <nav className="flex-1 px-3 py-4 overflow-y-auto">
           <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-[0.1em] px-2 mb-2">Main</p>
-          {NAV.slice(0, 4).map(item => <NavItem key={item.id} item={item} active={activeNav} onNav={setActiveNav} />)}
+          {NAV.slice(0, 4).map((item) => <NavItem key={item.id} item={item} active={activeNav} onNav={setActiveNav} />)}
           <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-[0.1em] px-2 mt-5 mb-2">Analytics</p>
-          {NAV.slice(4).map(item => <NavItem key={item.id} item={item} active={activeNav} onNav={setActiveNav} />)}
+          {NAV.slice(4).map((item) => <NavItem key={item.id} item={item} active={activeNav} onNav={setActiveNav} />)}
 
           <div className="mt-5">
             <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-[0.1em] px-2 mb-2">AI Assistant</p>
@@ -2719,20 +3075,10 @@ export default function Dashboard({ user, handleSignOut }) {
               className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[13px] font-medium transition-all duration-200 relative overflow-hidden ${
                 copilotOpen ? "text-violet-700 shadow-sm" : "text-slate-600 hover:text-violet-700"
               }`}
-              style={copilotOpen
-                ? { background: "linear-gradient(135deg, #f5f3ff, #eff6ff)" }
-                : { background: "linear-gradient(135deg, #faf5ff, #f0f4ff)" }}
             >
-              <motion.div
-                className="absolute inset-0 opacity-0 hover:opacity-100"
-                style={{ background: "linear-gradient(90deg, transparent, rgba(124,58,237,0.05), transparent)" }}
-                animate={{ x: ["-100%", "100%"] }}
-                transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
-              />
               <CopilotIcon size={16} className="shrink-0" />
               <span>Copilot</span>
-              <span className="ml-auto text-[9px] font-bold text-white px-1.5 py-0.5 rounded-full shadow-sm"
-                style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}>
+              <span className="ml-auto text-[9px] font-bold text-white px-1.5 py-0.5 rounded-full shadow-sm" style={{ background: "var(--color-primary)" }}>
                 AI
               </span>
             </motion.button>
@@ -2741,18 +3087,15 @@ export default function Dashboard({ user, handleSignOut }) {
 
         <div className="px-4 py-4 border-t border-slate-100/80 bg-white/60">
           <div className="flex items-center gap-2.5 p-2 rounded-xl hover:bg-slate-50 transition cursor-pointer relative group">
-            <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-blue-700 shrink-0"
-              style={{ background: "linear-gradient(135deg, #dbeafe, #c7d2fe)" }}>
+            <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-blue-700 shrink-0" style={{ background: "var(--color-primary-soft)" }}>
               {initials}
             </div>
             <div className="min-w-0">
-              <div className="text-[12px] font-semibold text-slate-800 leading-tight">{user?.displayName || "User"}</div>
+              <div className="text-[12px] font-semibold text-slate-800 leading-tight">{rawUserName || getDisplayFirstName("", user?.email)}</div>
               <div className="text-[10px] text-slate-400 leading-tight mt-0.5 truncate">{user?.email || "Product Manager"}</div>
             </div>
-            <button 
+            <button
               onClick={handleSignOut}
-              initial={{opacity: 0}}
-              animate={{opacity: 1}}
               className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-100 text-slate-600 p-1.5 rounded text-[10px] font-bold hover:bg-red-100 hover:text-red-600"
             >
               Logout
@@ -2762,7 +3105,18 @@ export default function Dashboard({ user, handleSignOut }) {
       </motion.aside>
 
       <div className="ml-60 flex flex-col min-h-screen">
-        <Header onNotif={() => setNotifOpen(true)} unreadCount={unreadCount} userName={shortName} setActiveNav={setActiveNav} />
+        <Header
+          onNotif={() => setNotifOpen((value) => !value)}
+          unreadCount={unreadCount}
+          userName={rawUserName}
+          userEmail={user?.email}
+          meetings={allMeetings}
+          tasks={allTasks}
+          onResultNavigate={goToEntity}
+          theme={theme}
+          onToggleTheme={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
+        />
+
         <main className="flex-1 px-8 py-7 max-w-6xl w-full">
           <AnimatePresence mode="wait">
             <motion.div
@@ -2778,8 +3132,20 @@ export default function Dashboard({ user, handleSignOut }) {
         </main>
       </div>
 
-      <NotificationPanel open={notifOpen} onClose={() => setNotifOpen(false)} />
-      <CopilotPanel open={copilotOpen} onClose={() => setCopilotOpen(false)} />
+      <NotificationPanel
+        open={notifOpen}
+        notifications={notifications}
+        onClose={() => setNotifOpen(false)}
+        onMarkAllRead={() => setNotifications((current) => current.map((item) => ({ ...item, read: true })))}
+        onItemClick={handleNotificationClick}
+      />
+
+      <SmartCopilotPanel open={copilotOpen} onClose={() => setCopilotOpen(false)} user={user} />
     </div>
   );
 }
+
+
+
+
+

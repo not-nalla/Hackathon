@@ -24,9 +24,16 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response && error.response.status === 401) {
+      const skipRedirect = Boolean(error.config?.skipAuthRedirect);
+      const currentPath = window.location.pathname;
+      const isAuthRoute = currentPath === '/login' || currentPath === '/signup' || currentPath === '/';
+
       localStorage.removeItem('smis_token');
       localStorage.removeItem('smis_user');
-      window.location.href = '/login';
+
+      if (!skipRedirect && !isAuthRoute) {
+        window.location.href = '/login';
+      }
     }
     return Promise.reject(error);
   }
