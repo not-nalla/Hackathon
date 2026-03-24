@@ -1,6 +1,8 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useAppData } from "../contexts/AppDataContext";
+
+const API_BASE = import.meta?.env?.VITE_API_BASE || "http://localhost:4000";
 
 const parseMeetingDateTime = (meeting) => {
   if (!meeting) return null;
@@ -20,6 +22,8 @@ const parseMeetingDateTime = (meeting) => {
 export default function MeetingDetailPage() {
   const { id } = useParams();
   const { meetings } = useAppData();
+  const [summary, setSummary] = useState("");
+  const [summaryStatus, setSummaryStatus] = useState("");
 
   const meeting = useMemo(
     () =>
@@ -41,6 +45,26 @@ export default function MeetingDetailPage() {
 
   const date = parseMeetingDateTime(meeting);
   const participants = meeting.participants || meeting.attendees || [];
+
+  const handleSummarize = async () => {
+    setSummaryStatus("Summarizing...");
+    try {
+      const token = localStorage.getItem("smis_token");
+      const res = await fetch(`${API_BASE}/api/meetings/${meeting._id || meeting.roomId}/summarize`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to summarize meeting");
+      setSummary(data.summary || "No summary generated.");
+      setSummaryStatus("");
+    } catch (err) {
+      setSummaryStatus(err.message || "Summary failed.");
+    }
+  };
 
   return (
     <div className="dashboard-theme dashboard-detail-page">
@@ -93,6 +117,27 @@ export default function MeetingDetailPage() {
           </div>
         )}
 
+        <div className="dashboard-detail-transcript-section">
+          <div className="dashboard-detail-actions" style={{ marginBottom: 12 }}>
+            <button className="btn btn-pill" onClick={handleSummarize}>
+              View Summary
+            </button>
+            {summaryStatus ? <span className="dashboard-detail-sub">{summaryStatus}</span> : null}
+          </div>
+          {summary || meeting.summary ? (
+            <>
+              <h3>Meeting Summary</h3>
+              <div className="dashboard-detail-transcript-list">
+                {(summary || meeting.summary).split("\n").map((line, idx) => (
+                  <div key={idx} className="dashboard-detail-transcript-item">
+                    <p>{line}</p>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : null}
+        </div>
+
         <div className="dashboard-detail-actions">
           <Link to="/dashboard?tab=meetings" className="dashboard-detail-link">Back to Meetings</Link>
         </div>
@@ -100,4 +145,3 @@ export default function MeetingDetailPage() {
     </div>
   );
 }
-

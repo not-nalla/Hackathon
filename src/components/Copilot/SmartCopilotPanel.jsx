@@ -4,6 +4,8 @@ import { AnimatePresence } from "framer-motion";
 import { SendHorizontal } from "lucide-react";
 import { useAppData } from "../../contexts/AppDataContext";
 
+const API_BASE = import.meta?.env?.VITE_API_BASE || "http://localhost:4000";
+
 const CHIPS = [
   "When is my next meeting",
   "What tasks are due today",
@@ -346,9 +348,16 @@ export default function SmartCopilotPanel({ open, onClose, user }) {
   const { meetings, tasks } = useAppData();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
+  const [mode, setMode] = useState("workspace");
+  const [selectedMeetingId, setSelectedMeetingId] = useState("");
+  const [isBusy, setIsBusy] = useState(false);
   const bottomRef = useRef(null);
 
   const hasUserMessage = useMemo(() => messages.some((msg) => msg.role === "user"), [messages]);
+  const selectedMeeting = useMemo(
+    () => (Array.isArray(meetings) ? meetings.find((meeting) => meeting._id === selectedMeetingId || meeting.roomId === selectedMeetingId) : null),
+    [meetings, selectedMeetingId]
+  );
 
   useEffect(() => {
     if (bottomRef.current) {
@@ -356,19 +365,84 @@ export default function SmartCopilotPanel({ open, onClose, user }) {
     }
   }, [messages]);
 
+  const appendMessage = (role, text) => {
+    const timestamp = new Date().toISOString();
+    setMessages((prev) => [
+      ...prev,
+      { id: `${role}-${timestamp}-${Math.random().toString(36).slice(2, 6)}`, role, text, timestamp },
+    ]);
+  };
+
+  const callMeetingSummary = async () => {
+    if (!selectedMeetingId) {
+      appendMessage("assistant", "Please choose a meeting first.");
+      return;
+    }
+    setIsBusy(true);
+    appendMessage("assistant", "Summarizing the meeting transcript...");
+    try {
+      const token = localStorage.getItem("smis_token");
+      const res = await fetch(`${API_BASE}/api/meetings/${selectedMeetingId}/summarize`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to summarize meeting");
+      appendMessage("assistant", data.summary || "No summary generated.");
+    } catch (err) {
+      appendMessage("assistant", err.message || "Summary failed.");
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const callMeetingQA = async (question) => {
+    if (!selectedMeetingId) {
+      appendMessage("assistant", "Please choose a meeting first.");
+      return;
+    }
+    setIsBusy(true);
+    try {
+      const token = localStorage.getItem("smis_token");
+      const res = await fetch(`${API_BASE}/api/meetings/${selectedMeetingId}/qa`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ question }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to answer question");
+      appendMessage("assistant", data.answer || "No answer generated.");
+    } catch (err) {
+      appendMessage("assistant", err.message || "Q&A failed.");
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   const sendMessage = (rawText) => {
     const text = String(rawText || "").trim();
     if (!text) return;
 
     const sentAt = new Date();
-    const botReply = generateResponse(text, meetings, tasks, user);
-
     setMessages((prev) => [
       ...prev,
       { id: `u-${sentAt.getTime()}`, role: "user", text, timestamp: sentAt.toISOString() },
-      { id: `b-${sentAt.getTime()}-r`, role: "assistant", text: botReply, timestamp: new Date().toISOString() },
     ]);
     setInput("");
+
+    if (mode === "meeting") {
+      callMeetingQA(text);
+      return;
+    }
+
+    const botReply = generateResponse(text, meetings, tasks, user);
+    appendMessage("assistant", botReply);
   };
 
   const onChipClick = (chip) => {
@@ -398,6 +472,49 @@ export default function SmartCopilotPanel({ open, onClose, user }) {
               <button onClick={onClose} className="btn btn-ghost w-7 h-7 rounded-lg text-[var(--color-text-secondary)]">
                 x
               </button>
+            </div>
+
+            <div className="px-5 py-3 border-b border-[var(--color-border)] space-y-2">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setMode("meeting")}
+                  className={`btn btn-pill text-[11px] ${mode === "meeting" ? "btn-primary" : ""}`}
+                >
+                  Meeting Mode
+                </button>
+                <button
+                  onClick={() => setMode("workspace")}
+                  className={`btn btn-pill text-[11px] ${mode === "workspace" ? "btn-primary" : ""}`}
+                >
+                  Workspace Mode
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <select
+                  value={selectedMeetingId}
+                  onChange={(event) => setSelectedMeetingId(event.target.value)}
+                  className="flex-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2 text-[12px] text-[var(--color-text)]"
+                >
+                  <option value="">Select a meeting</option>
+                  {(Array.isArray(meetings) ? meetings : []).map((meeting) => (
+                    <option key={meeting._id || meeting.roomId} value={meeting._id || meeting.roomId}>
+                      {meeting.title || "Untitled meeting"} · {meeting.roomId || meeting._id}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={callMeetingSummary}
+                  className="btn btn-pill text-[11px]"
+                  disabled={!selectedMeetingId || isBusy}
+                >
+                  Summarize
+                </button>
+              </div>
+              {selectedMeeting ? (
+                <div className="text-[11px] text-[var(--color-text-muted)]">
+                  Active meeting: {selectedMeeting.title || "Untitled meeting"}
+                </div>
+              ) : null}
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -444,14 +561,14 @@ export default function SmartCopilotPanel({ open, onClose, user }) {
                 <input
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
-                  onKeyDown={(event) => event.key === "Enter" && sendMessage(input)}
+                  onKeyDown={(event) => event.key === "Enter" && !isBusy && sendMessage(input)}
                   className="flex-1 bg-transparent outline-none text-[13px] text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]"
-                  placeholder="Ask about your meetings and tasks"
+                  placeholder={mode === "meeting" ? "Ask about the selected meeting" : "Ask about your meetings and tasks"}
                 />
                 <button
                   onClick={() => sendMessage(input)}
                   className="btn btn-icon-circle btn-primary w-9 h-9 inline-flex items-center justify-center disabled:opacity-50"
-                  disabled={!input.trim()}
+                  disabled={!input.trim() || isBusy}
                 >
                   <SendHorizontal size={15} />
                 </button>

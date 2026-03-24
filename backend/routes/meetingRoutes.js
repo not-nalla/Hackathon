@@ -3,6 +3,7 @@ const router = express.Router();
 const Meeting = require('../models/Meeting');
 const authMiddleware = require('../middleware/authMiddleware');
 const { AccessToken } = require('livekit-server-sdk');
+const mongoose = require('mongoose');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -13,6 +14,9 @@ const buildJoinUrl = (roomId) => `${getFrontendBaseUrl()}/join/${roomId}`;
 const buildRoomUrl = (roomId) => `${getFrontendBaseUrl()}/room/${roomId}`;
 
 const activeTranscriptionJobs = new Map();
+const GEMINI_MODEL = 'gemini-flash-latest';
+const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const MAX_TRANSCRIPT_CHARS = 12000;
 
 const appendTranscriptEntry = async (roomId, entry) => {
   const meeting = await Meeting.findOne({ roomId });
@@ -37,6 +41,97 @@ const appendTranscriptEntry = async (roomId, entry) => {
   }
 
   return { ok: true };
+};
+
+const buildTranscriptText = (meeting) => {
+  const transcript = Array.isArray(meeting?.transcript) ? meeting.transcript : [];
+  const text = transcript
+    .map((entry) => `${entry.speaker || 'Speaker'}: ${entry.text || ''}`.trim())
+    .filter(Boolean)
+    .join('\n');
+  if (text.length <= MAX_TRANSCRIPT_CHARS) return text;
+  return text.slice(text.length - MAX_TRANSCRIPT_CHARS);
+};
+
+const resolveMeetingById = async (id) => {
+  if (!id) return null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    const byId = await Meeting.findById(id);
+    if (byId) return byId;
+  }
+  return Meeting.findOne({ roomId: id });
+};
+
+const callGemini = async (prompt) => {
+  const apiKey = process.env.GOOGLE_GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [{ text: prompt }],
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    const message = data?.error?.message || 'Gemini request failed';
+    throw new Error(message);
+  }
+
+  const text = data?.candidates?.[0]?.content?.parts?.map((part) => part.text).join('') || '';
+  return text.trim();
+};
+
+const summarizeTranscriptLocal = (meeting) => {
+  const transcript = Array.isArray(meeting?.transcript) ? meeting.transcript : [];
+  if (!transcript.length) return '';
+
+  const recent = transcript.slice(-12);
+  const bullets = recent.map((entry) => {
+    const speaker = entry.speaker || 'Speaker';
+    const text = String(entry.text || '').trim();
+    if (!text) return null;
+    return `• ${speaker}: ${text}`;
+  }).filter(Boolean);
+
+  const actionItems = transcript.filter((entry) => {
+    const text = String(entry.text || '').toLowerCase();
+    return text.includes('action') || text.includes('todo') || text.includes('next') || text.includes('will');
+  }).slice(-5);
+
+  if (actionItems.length) {
+    bullets.push('• Action items:');
+    actionItems.forEach((entry) => {
+      const speaker = entry.speaker || 'Speaker';
+      const text = String(entry.text || '').trim();
+      if (text) bullets.push(`• ${speaker}: ${text}`);
+    });
+  }
+
+  return bullets.join('\n');
+};
+
+const answerQuestionLocal = (meeting, question) => {
+  const transcript = Array.isArray(meeting?.transcript) ? meeting.transcript : [];
+  if (!transcript.length) return '';
+  const terms = String(question || '')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word.length > 3);
+  if (!terms.length) return '';
+
+  const match = transcript.findLast
+    ? transcript.findLast((entry) => terms.some((term) => String(entry.text || '').toLowerCase().includes(term)))
+    : [...transcript].reverse().find((entry) => terms.some((term) => String(entry.text || '').toLowerCase().includes(term)));
+
+  if (!match) return '';
+  return `${match.speaker || 'Speaker'}: ${match.text || ''}`.trim();
 };
 
 const toClientMeeting = (meetingDoc) => {
@@ -262,6 +357,80 @@ router.post('/room/:roomId/transcription/stop', async (req, res) => {
   }
 });
 
+// Summarize a meeting transcript using Gemini
+router.post('/:id/summarize', async (req, res) => {
+  try {
+    const meeting = await resolveMeetingById(req.params.id);
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+
+    const transcriptText = buildTranscriptText(meeting);
+    if (!transcriptText) {
+      return res.status(400).json({ error: 'No transcript found for this meeting' });
+    }
+
+    const prompt = [
+      'You are a meeting assistant.',
+      'Summarize the following transcript into concise, readable bullet points.',
+      'Include key decisions, action items, risks, and next steps if present.',
+      'Use a clear, professional tone.',
+      '',
+      'Transcript:',
+      transcriptText,
+    ].join('\n');
+
+    let summary = await callGemini(prompt);
+    if (!summary) {
+      summary = summarizeTranscriptLocal(meeting);
+    }
+    if (summary) {
+      meeting.summary = summary;
+      await meeting.save();
+    }
+
+    res.json({ summary });
+  } catch (err) {
+    console.error('Summarize error:', err);
+    res.status(500).json({ error: err.message || 'Failed to summarize transcript' });
+  }
+});
+
+// Q&A about a meeting transcript using Gemini
+router.post('/:id/qa', async (req, res) => {
+  try {
+    const { question } = req.body;
+    if (!question) return res.status(400).json({ error: 'Question is required' });
+    const meeting = await resolveMeetingById(req.params.id);
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+
+    const transcriptText = buildTranscriptText(meeting);
+    if (!transcriptText) {
+      return res.status(400).json({ error: 'No transcript found for this meeting' });
+    }
+
+    const prompt = [
+      'You answer questions strictly from the transcript.',
+      'If the answer is not in the transcript, say "I could not find that in this meeting transcript."',
+      '',
+      `Question: ${question}`,
+      '',
+      'Transcript:',
+      transcriptText,
+    ].join('\n');
+
+    let answer = await callGemini(prompt);
+    if (!answer) {
+      answer = answerQuestionLocal(meeting, question);
+      if (!answer) {
+        answer = 'I could not find that in this meeting transcript.';
+      }
+    }
+    res.json({ answer });
+  } catch (err) {
+    console.error('QA error:', err);
+    res.status(500).json({ error: err.message || 'Failed to answer question' });
+  }
+});
+
 // LiveKit Join — generates token, determines host, updates meeting status
 router.post('/join/:roomId', async (req, res) => {
   const { roomId } = req.params;
@@ -331,6 +500,32 @@ router.post('/end/:roomId', async (req, res) => {
       return res.status(403).json({ error: 'Only the host can end the meeting' });
     }
     await Meeting.findByIdAndUpdate(meeting._id, { status: 'Completed' });
+
+    // Auto-summarize on meeting end if transcript exists and Gemini key is configured
+    try {
+      const transcriptText = buildTranscriptText(meeting);
+      if (transcriptText) {
+        const prompt = [
+          'You are a meeting assistant.',
+          'Summarize the following transcript into concise, readable bullet points.',
+          'Include key decisions, action items, risks, and next steps if present.',
+          'Use a clear, professional tone.',
+          '',
+          'Transcript:',
+          transcriptText,
+        ].join('\n');
+        let summary = await callGemini(prompt);
+        if (!summary) {
+          summary = summarizeTranscriptLocal(meeting);
+        }
+        if (summary) {
+          await Meeting.findByIdAndUpdate(meeting._id, { summary });
+        }
+      }
+    } catch (err) {
+      console.error('Auto-summarize failed:', err);
+    }
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to end meeting' });
